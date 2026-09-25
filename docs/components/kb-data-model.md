@@ -6,6 +6,35 @@ graph described here, so the findings only make sense once this model is clear.
 
 ## The four layers
 
+### Codex distill completion (turn snapshots)
+
+Codex raw captures are per-turn, not Claude's per-session reader file. Never use
+an old `last_parsed_offset` record to measure Codex distill progress. The worker
+creates a private immutable plan of pending Codex captures for the selected
+session, bounded by the launch snapshot's `rollout_end_offset`. It processes
+bounded batches (default 16, `KA_CODEX_DISTILL_BATCH_SIZE`, maximum 64), then
+independently verifies snapshot acknowledgements. Missing acknowledgement fails
+the run even if the model exits successfully or writes a statistics file.
+
+Later captures and continuations are left for the next run. A continuation may
+remain pending while the frozen prefix is acknowledged. Restarting after a
+failure selects only remaining work; completed knowledge is not regenerated.
+Plans and their private text stay under runtime state, never in public Git.
+`codex_pending: 0` means the fixed plan is complete, not that future live turns
+are already distilled. Claude's existing byte-cursor path remains separate.
+
+Before retiring a main session, audit capture coverage against its original
+rollout, drain its plan, refresh retrieval and verify representative knowledge.
+Keep the original rollout for audit and recovery; do not truncate it or advance
+a legacy cursor merely to silence a failure.
+
+For explicit capture repair, pipe the runtime reader's `--format json` output to
+`capture-snapshot-cli.js recover --raw-dir <private-raw-dir> --session <id>`.
+This audits by default. Add `--apply true` only after inspecting coverage: it
+creates deterministic, provenance-tagged recovery raws for missing messages,
+never rewrites existing raws, and is idempotent. These records require ordinary
+snapshot acknowledgement and knowledge review, not automatic completion.
+
 The KB is a directory of Markdown files in four layers (the INDEX itself declares them):
 
 | Layer | Location | What it is | Loaded at startup? |

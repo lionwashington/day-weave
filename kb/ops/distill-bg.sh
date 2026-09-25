@@ -151,8 +151,14 @@ fi
 
 # Capture snapshot via the lightweight --format snapshot path (no message body)
 # and parse the three progress fields via Node (jq may not be installed).
+if [ "$KA_DISTILL_RUNTIME" = codex ]; then
+    # Per-turn capture metadata supplies the bounded work set. Counting every
+    # message in a multi-GB append-only rollout is unrelated to distill progress.
+    SNAPSHOT_LINE="$(node -e 'process.stdout.write(`${require("fs").statSync(process.argv[1]).size}\t\t0`)' "$JSONL")"
+else
 SNAPSHOT_LINE="$(node "$JSONL_READER" --jsonl "$JSONL" --format snapshot 2>/dev/null \
     | node -e 'let d=""; process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>{try{const j=JSON.parse(d); process.stdout.write(`${j.progress.offset}\t${j.progress.lastEntryUuid}\t${j.progress.messageCount}`)}catch{process.exit(2);}})' || true)"
+fi
 
 if [ -z "$SNAPSHOT_LINE" ]; then
     log_err "failed to capture snapshot from $JSONL"

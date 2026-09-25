@@ -1,7 +1,9 @@
 import { resolve } from 'node:path'
-import { realpathSync } from 'node:fs'
+import { realpathSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { createCaptureSnapshot, acknowledgeCaptureSnapshot } from './snapshot.js'
+import { planDistill, pendingDistill } from './distill-plan.js'
+import { recoverMessages } from './recover-messages.js'
 
 export function main(args = process.argv.slice(2)): void {
   const [command, ...rest] = args
@@ -11,7 +13,19 @@ export function main(args = process.argv.slice(2)): void {
     flags.set(rest[i], rest[i + 1])
   }
   const required = (key: string) => { const v = flags.get(key); if (!v) throw new Error(`missing ${key}`); return v }
-  if (command === 'snapshot') {
+  if (command === 'recover') {
+    const input = JSON.parse(readFileSync(0, 'utf8'))
+    process.stdout.write(JSON.stringify(recoverMessages(required('--raw-dir'), required('--session'), input, flags.get('--apply') === 'true')) + '\n')
+  } else if (command === 'plan') {
+    const plan = planDistill(required('--raw-dir'), required('--session'), Number(required('--upper')), required('--dir'))
+    process.stdout.write(JSON.stringify({ ok: true, count: plan.count, deferred: plan.deferred }) + '\n')
+  } else if (command === 'pending') {
+    process.stdout.write(JSON.stringify(pendingDistill(required('--plan'))) + '\n')
+  } else if (command === 'read') {
+    const snapshot = JSON.parse(readFileSync(required('--job'), 'utf8'))
+    const sections = snapshot.body.split(/(?=^## (?:User|Assistant)$)/m).filter((s: string) => s.trim())
+    process.stdout.write(JSON.stringify({ file: snapshot.file, text: sections.slice(snapshot.processedPrefix).join('') }) + '\n')
+  } else if (command === 'snapshot') {
     const snapshot = createCaptureSnapshot(required('--raw-dir'), required('--file'), required('--job'))
     // Explicit snapshot reading is the only command that returns private text.
     const sections = snapshot.body.split(/(?=^## (?:User|Assistant)$)/m).filter(s => s.trim())
