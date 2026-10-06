@@ -171,6 +171,57 @@ function wellnessProvider({ fail = false } = {}) {
   };
 }
 
+test('sleep rename cannot be shadowed by daily summary or HRV descriptions', () => {
+  const tools = [{name:'queryDailyHealthData',description:'sleep HRV recovery'},
+    {name:'querySleepHrv'}, {name:'querySleepData'}, {name:'querySleepOverview'}];
+  assert.equal(selectWellnessTools(tools).find(x=>x.kind==='sleep').tool.name,'querySleepOverview');
+  assert.equal(selectWellnessTools(tools.slice(0,2)).some(x=>x.kind==='sleep'),false);
+  assert.equal(selectWellnessTools(tools).find(x=>x.kind==='daily').tool.name,'queryDailyHealthData');
+});
+
+test('new sleep labels preserve wake day, actual sleep, window, naps and daily scope separately', () => {
+  const [row] = normalizeObservations([{kind:'sleep',tool:'querySleepOverview',payload:{content:[{type:'text',text:JSON.stringify(
+    '2032-02-03\nMain Sleep (asleep): 6h 10min\nMain Sleep Period (incl. awake): 7h 0min\nDaily Sleep: 6h 30min (incl. naps)\nAwake Time: 50 min\nAwake Count (>5 min): 3\nSleep metrics scope: daily\nMain Sleep Window: 2032-02-02 23:30 - 2032-02-03 06:30\nNaps Total: 20 min')}]}}]);
+  assert.equal(row.date,'2032-02-03');
+  assert.equal(row.sleep_minutes,370);
+  assert.equal(row.sleep_window_minutes,420);
+  assert.equal(row.daily_sleep_minutes,390);
+  assert.equal(row.awake_minutes,50);
+  assert.equal(row.awake_count,3);
+  assert.equal(row.naps_minutes,20);
+  assert.equal(row.sleep_start_local,'2032-02-02 23:30');
+  assert.equal(row.sleep_end_local,'2032-02-03 06:30');
+  assert.equal(row.sleep_metrics_scope,'daily');
+  const [zero] = normalizeObservations([{kind:'sleep',tool:'querySleepOverview',payload:'2032-02-04\nAwake Time: 0h 0min\nNaps Total: 0 min\nMain Sleep Period (incl. awake): 8h 0min'}]);
+  assert.equal(zero.awake_minutes,0);
+  assert.equal(zero.sleep_minutes,undefined);
+});
+
+test('nap asleep labels support old/new and zero without using awake-inclusive periods', () => {
+  const parse = text => normalizeObservations([{kind:'sleep',tool:'querySleepOverview',
+    payload:'2032-02-03\nMain Sleep (asleep): 6h 0min\n'+text}])[0];
+  for (const label of ['Naps Total', 'Naps Total (asleep)']) {
+    assert.equal(parse(`${label}: 1h 12min\nNaps Period (incl. awake): 1h 20min`).naps_minutes,72);
+    assert.equal(parse(`${label}: 0 min`).naps_minutes,0);
+  }
+  const absent=parse('Naps Period (incl. awake): 1h 20min\nNap Window: 13:00 - 14:20');
+  assert.equal(absent.naps_minutes,undefined);
+  assert.equal(absent.sleep_minutes,360);
+});
+
+test('missing dedicated sleep is reported as missing category, not summary coverage', async () => {
+  const root=mkdtempSync(join(tmpdir(),'coros-sleep-missing-'));
+  try {
+    const result=await syncWellness({root}, {startDate:'2032-02-03',endDate:'2032-02-03',provider:{
+      listTools:()=>[{name:'queryDailyHealthData',description:'sleep recovery',inputSchema:{}}],
+      callTool:()=> '2032-02-03\nTotal: 8h 0min',
+    }});
+    assert.ok(result.missing_categories.includes('sleep'));
+    assert.ok(result.missing_latest_metrics.includes('sleep_minutes'));
+    assert.equal(result.remote.status,'partial');
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
 test('official tool discovery and arguments cover health and date-range schemas', () => {
   const selected = selectWellnessTools([
     { name: 'queryHrvAssessment', description: '' },
@@ -266,6 +317,29 @@ test('successful tool calls with stale records report partial; changed raw revis
   const again=await syncWellness(paths,{...options,provider});
   assert.equal(again.daily_changed,false);
   assert.equal(readFileSync(wp.history,'utf8'),history);
+});
+
+test('refreshes catalog and retains successful sleep when another capability fails', async () => {
+  const root=mkdtempSync(join(tmpdir(),'coros-partial-'));
+  try {
+    let refreshed=false;
+    const provider={listTools: refresh=>{refreshed=refresh;return [{name:'querySleepOverview'},{name:'queryRecoveryStatus'}];},
+      callTool:name=>{if(name==='queryRecoveryStatus')throw Error('secret must not escape');return '2032-02-03\nMain Sleep (asleep): 7h 0min';}};
+    const paths={root};const opts={provider,startDate:'2032-02-03',endDate:'2032-02-03'};
+    const result=await syncWellness(paths,opts);
+    assert.equal(refreshed,true);
+    assert.equal(result.remote.status,'partial');
+    assert.deepEqual(result.tools_failed,['queryRecoveryStatus']);
+    assert.ok(!JSON.stringify(result).includes('secret must'));
+    assert.equal(wellnessTrend(paths).latest.sleep_minutes,420);
+    assert.deepEqual(wellnessTrend(paths).tools_failed,['queryRecoveryStatus']);
+    const again=await syncWellness(paths,opts);
+    assert.equal(again.observations_new,0);assert.equal(again.daily_changed,false);
+    provider.callTool=()=>{throw Error('offline');};
+    const failed=await syncWellness(paths,opts);
+    assert.equal(failed.remote.status,'failed');
+    assert.equal(wellnessTrend(paths).latest.sleep_minutes,420);
+  }finally{rmSync(root,{recursive:true,force:true});}
 });
 
 test('wellness sync is incremental, idempotent and strips OAuth secrets', async () => {

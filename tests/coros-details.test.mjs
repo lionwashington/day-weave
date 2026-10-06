@@ -5,6 +5,11 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {syncDetails,readDetails,sanitize,buildJobs,labelledFields} from '../kb/skills/coros-health/scripts/coros-details.mjs';
 const tool=name=>({name,inputSchema:{properties:{startDate:{},endDate:{},days:{}}}});
+test('renamed sleep overview is fetched by wake day without FIT downloads',()=>{
+ const jobs=buildJobs([tool('querySleepOverview')],[],'2031-04-01','2031-04-02');
+ assert.equal(jobs.length,2);
+ assert.deepEqual(jobs.map(j=>j.args),[{startDate:'20310401',endDate:'20310401',days:1},{startDate:'20310402',endDate:'20310402',days:1}]);
+});
 test('lossless fields retain unknown values and wake-day headings while removing nested secrets',()=>{
   const value=sanitize({content:[{text:JSON.stringify({access_token:'SENSITIVE',unknown:[3,'4 bpm'],text:'20310403\nMain Sleep Window: 2031-04-02 23:00 - 2031-04-03 06:00\nNovel Field: 8 foos'})}]});
   assert.ok(!JSON.stringify(value).includes('SENSITIVE'));

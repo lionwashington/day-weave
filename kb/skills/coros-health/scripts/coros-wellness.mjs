@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { assertSafeHelper } from './prepare-helper.mjs';
 
 export const WELLNESS_SCHEMA_VERSION = 1;
-export const WELLNESS_ALGORITHM_VERSION = 2;
+export const WELLNESS_ALGORITHM_VERSION = 4;
 const SECRET_KEY = /(?:access|refresh)[_-]?token|authorization|password|secret|code[_-]?verifier|poll[_-]?token|login[_-]?ticket/i;
 const DAY_MS = 86_400_000;
 const OFFICIAL_TOOL_GROUPS = {
@@ -21,7 +21,7 @@ const OFFICIAL_TOOL_GROUPS = {
 };
 const OFFICIAL_TOOL_NAMES = {
   hrv: ['querySleepHrv', 'queryHrvAssessment'],
-  sleep: ['querySleepData'],
+  sleep: ['querySleepOverview', 'querySleepData'],
   resting_heart_rate: ['queryRestingHeartRate'],
   stress: ['queryStressLevel'],
   recovery: ['queryRecoveryStatus'],
@@ -134,17 +134,18 @@ export function createOfficialProvider(options = {}) {
   };
 }
 
-function toolText(tool) {
-  return `${tool?.name || ''} ${tool?.description || ''}`;
-}
-
 export function selectWellnessTools(tools) {
   const selected = [];
   const used = new Set();
   for (const [kind, patterns] of Object.entries(OFFICIAL_TOOL_GROUPS)) {
     const preferred = OFFICIAL_TOOL_NAMES[kind] || [];
-    const tool = tools.find((candidate) => !used.has(candidate.name) && preferred.includes(candidate.name))
-      || tools.find((candidate) => !used.has(candidate.name) && patterns.some((pattern) => pattern.test(toolText(candidate))));
+    // Names are capabilities; incidental words in descriptions are not. A daily
+    // summary mentioning sleep must not consume the dedicated sleep category.
+    const tool = preferred.map(name => tools.find(candidate => candidate.name === name && !used.has(name))).find(Boolean)
+      || tools.find((candidate) => !used.has(candidate.name)
+        && !Object.values(OFFICIAL_TOOL_NAMES).flat().includes(candidate.name)
+        && (kind !== 'sleep' || !/hrv/i.test(candidate.name))
+        && patterns.some((pattern) => pattern.test(candidate.name)));
     if (tool && !used.has(tool.name)) {
       selected.push({ kind, tool });
       used.add(tool.name);
@@ -249,6 +250,9 @@ function metricFields(record, kind) {
     sleep_window_minutes: ['sleep_window_minutes'],
     sleep_score: ['sleepScore', 'sleep_score', 'qualityScore', 'quality_score'],
     awake_minutes: ['awakeMinutes', 'awake_minutes'],
+    daily_sleep_minutes: ['daily_sleep_minutes'],
+    naps_minutes: ['naps_minutes'],
+    awake_count: ['awake_count'],
     avg_hr_bpm: ['avgHeartRate', 'averageHeartRate', 'avg_hr', 'avgHr'],
     steps: ['steps', 'stepCount', 'step_count'],
     calories_kcal: ['calories', 'caloriesKcal', 'calories_kcal'],
@@ -260,6 +264,11 @@ function metricFields(record, kind) {
   for (const [field, aliases] of Object.entries(definitions)) {
     const value = numeric(record, aliases);
     if (value !== null) output[field] = value;
+  }
+  if (kind === 'sleep') {
+    for (const field of ['sleep_start_local', 'sleep_end_local', 'sleep_metrics_scope']) {
+      if (typeof record[field] === 'string') output[field] = record[field];
+    }
   }
   if (kind === 'hrv' && output.hrv_ms === undefined) {
     const value = numeric(record, ['value', 'score']);
@@ -286,7 +295,7 @@ function durationMinutes(line) {
   const value = line.split(':').slice(1).join(':');
   const hours = Number(value.match(/(\d+(?:\.\d+)?)\s*h/i)?.[1] || 0);
   const minutes = Number(value.match(/(\d+(?:\.\d+)?)\s*m(?:in)?\b/i)?.[1] || 0);
-  if (hours || minutes) return hours * 60 + minutes;
+  if (/\d+(?:\.\d+)?\s*(?:h\b|m(?:in)?\b)/i.test(value)) return hours * 60 + minutes;
   const plain = value.match(/(\d+(?:\.\d+)?)\s*(?:minutes?|min)\b/i);
   return plain ? Number(plain[1]) : null;
 }
@@ -317,8 +326,17 @@ function textRecords(text, kind, fallbackDate) {
       else if (/^Baseline:/i.test(line)) target.hrv_baseline_ms = valueAfterColon(line);
     } else if (kind === 'sleep') {
       if (/^Sleep Score:/i.test(line)) target.sleep_score = valueAfterColon(line);
-      else if (/^Main Sleep:/i.test(line)) target.sleep_minutes = durationMinutes(line);
+      else if (/^Main Sleep(?: \(asleep\))?:/i.test(line)) target.sleep_minutes = durationMinutes(line);
+      else if (/^Main Sleep Period \(incl\. awake\):/i.test(line)) target.sleep_window_minutes = durationMinutes(line);
+      else if (/^Daily Sleep:/i.test(line)) target.daily_sleep_minutes = durationMinutes(line);
+      else if (/^Naps Total(?: \(asleep\))?:/i.test(line)) target.naps_minutes = durationMinutes(line);
       else if (/^Awake Time:/i.test(line)) target.awake_minutes = durationMinutes(line);
+      else if (/^Awake Count(?: \(.*\))?:/i.test(line)) target.awake_count = valueAfterColon(line);
+      else if (/^Sleep metrics scope:/i.test(line)) target.sleep_metrics_scope = line.split(':').slice(1).join(':').trim();
+      else if (/^Main Sleep Window:/i.test(line)) {
+        const window = line.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s+-\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
+        if (window) { target.sleep_start_local = window[1]; target.sleep_end_local = window[2]; }
+      }
     } else if (kind === 'resting_heart_rate') {
       if (date && line.includes(':')) target.resting_hr_bpm = valueAfterColon(line);
     } else if (kind === 'stress' || kind === 'daily') {
@@ -341,7 +359,10 @@ export function normalizeObservations(observations) {
   const byDate = new Map();
   const rank = new Map();
   const owners = { hrv_ms: 'hrv', hrv_baseline_ms: 'hrv', sleep_minutes: 'sleep',
-    sleep_score: 'sleep', awake_minutes: 'sleep', resting_hr_bpm: 'resting_heart_rate', stress: 'stress' };
+    sleep_score: 'sleep', awake_minutes: 'sleep', sleep_window_minutes: 'sleep',
+    daily_sleep_minutes: 'sleep', naps_minutes: 'sleep', awake_count: 'sleep',
+    sleep_start_local: 'sleep', sleep_end_local: 'sleep', sleep_metrics_scope: 'sleep',
+    resting_hr_bpm: 'resting_heart_rate', stress: 'stress' };
   // Freshness is acquisition time, never lexical range-key order.
   const ordered = [...observations].sort((a,b) => String(a.fetched_at || '').localeCompare(String(b.fetched_at || '')) || String(a.key || '').localeCompare(String(b.key || '')));
   for (const observation of ordered) {
@@ -447,18 +468,30 @@ export async function syncWellness(paths, options = {}) {
   const provider = options.provider || createOfficialProvider(options);
   const result = { remote: { status: 'not_attempted', error: null }, start_date: start, end_date: today, tools_called: [], missing_categories: [], observations_new: 0, daily_changed: false, data_through: previous.data_through || null };
   try {
-    const tools = await provider.listTools(options.refreshTools);
+    // The remote capability catalogue can change without a local upgrade.
+    // Refresh once per network sync; offline trend/rebuild never queries it.
+    const tools = await provider.listTools(true);
     const selected = selectWellnessTools(tools);
     if (!selected.length) throw new Error('official COROS MCP exposed no supported wellness tools');
     result.missing_categories = ['hrv', 'sleep', 'resting_heart_rate', 'stress', 'recovery']
       .filter((kind) => !selected.some((entry) => entry.kind === kind));
     const existing = readJsonl(wp.raw);
     const incoming = [];
+    result.tools_failed = [];
     for (const { kind, tool } of selected) {
       const args = argumentsForTool(tool, start, today);
-      const payload = scrub(await provider.callTool(tool.name, args));
-      incoming.push({ key: `${tool.name}:${start}:${today}`, schema_version: WELLNESS_SCHEMA_VERSION, fetched_at: new Date().toISOString(), range: { start_date: start, end_date: today }, kind, tool: tool.name, payload });
       result.tools_called.push(tool.name);
+      let payload;
+      try {
+        const response = await provider.callTool(tool.name, args);
+        if (response?.isError) throw new Error('tool returned an error');
+        payload = scrub(response);
+      } catch {
+        // Report capability, not provider text which may contain credentials.
+        result.tools_failed.push(tool.name);
+        continue;
+      }
+      incoming.push({ key: `${tool.name}:${start}:${today}`, schema_version: WELLNESS_SCHEMA_VERSION, fetched_at: new Date().toISOString(), range: { start_date: start, end_date: today }, kind, tool: tool.name, payload });
     }
     const merged = mergeByKey(existing, incoming, 'key');
     // Preserve superseded raw observations before replacing logical keys.
@@ -483,10 +516,12 @@ export async function syncWellness(paths, options = {}) {
     const expected = ['hrv_ms', 'sleep_minutes', 'resting_hr_bpm', 'stress', 'recovery'];
     result.metric_data_through = Object.fromEntries(expected.map(field => [field, current.filter(row => Number.isFinite(row[field])).at(-1)?.date || null]));
     result.missing_latest_metrics = expected.filter(field => result.metric_data_through[field] !== today);
-    result.remote.status = result.missing_categories.length || result.missing_latest_metrics.length || !rebuilt.daily_count ? 'partial' : 'ok';
+    result.remote.status = !incoming.length ? 'failed'
+      : result.tools_failed.length || result.missing_categories.length || result.missing_latest_metrics.length || !rebuilt.daily_count ? 'partial' : 'ok';
     if (result.remote.status === 'partial') result.remote.error = result.missing_categories.length
       ? `official tool coverage missing: ${result.missing_categories.join(', ')}`
       : `official responses lack requested-day metrics: ${result.missing_latest_metrics.join(', ')}`;
+    if (result.tools_failed.length) result.remote.error = `official tools failed: ${result.tools_failed.join(', ')}`;
   } catch (error) {
     result.remote.status = 'failed';
     result.remote.error = compactError(error);
@@ -500,6 +535,8 @@ export async function syncWellness(paths, options = {}) {
     metric_data_through: result.metric_data_through || previous.metric_data_through || {},
     missing_latest_metrics: result.missing_latest_metrics || previous.missing_latest_metrics || [],
     last_remote_status: result.remote.status,
+    tools_failed: result.tools_failed || [],
+    missing_categories: result.missing_categories,
   }));
   return result;
 }
@@ -529,6 +566,8 @@ export function wellnessTrend(paths, { days = 28, date = localToday() } = {}) {
     metric_data_through: state.metric_data_through || {},
     missing_latest_metrics: state.missing_latest_metrics || [],
     last_remote_status: state.last_remote_status || null,
+    tools_failed: state.tools_failed || [],
+    missing_categories: state.missing_categories || [],
     report: wellnessReport(daily, date),
     trends: readJson(wp.trends, null),
   };

@@ -41,6 +41,22 @@ The training-load join is by local calendar date against cached normalized activ
 
 ## Normalized metrics
 
+Wellness algorithm 4 accepts both `Naps Total` and `Naps Total (asleep)` as
+`naps_minutes`. `Naps Period (incl. awake)` is not actual sleep and is never a
+fallback for that field. Offline `wellness-rebuild` applies this correction to
+cached observations without fetching remote data.
+
+Wellness algorithm 3 supports official `querySleepOverview` and legacy
+`querySleepData`. Discovery matches capability names, not incidental description
+keywords. Missing dedicated sleep capability remains a missing category.
+`Main Sleep (asleep)` maps to `sleep_minutes`; `Main Sleep Period (incl. awake)`
+maps to `sleep_window_minutes`. `daily_sleep_minutes` includes naps;
+`naps_minutes`, `awake_minutes`, `awake_count`, and `sleep_metrics_scope` preserve
+vendor semantics (a daily scope need not describe only the main episode).
+`sleep_start_local`/`sleep_end_local` preserve the main window's source local
+timestamps, without UTC conversion or inference from duration. Rebuild is offline
+and cannot recover data never fetched; sync the missing date range after upgrade.
+
 Wellness algorithm 2 recognizes only explicit record headings (ISO or compact
 calendar dates). Dates embedded in request titles, missing-data notices or sleep
 windows cannot change the wake-up-day record. Undated recovery snapshots alone

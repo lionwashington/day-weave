@@ -732,7 +732,7 @@ async function main(argv = process.argv.slice(2)) {
   if (command === 'oauth-status') { output(officialOauth('login-status', { cacheRoot: args['oauth-cache-root'] })); return; }
   const paths = resolvePaths({ workspace: args.workspace, dataRoot: args['data-root'] });
   if (command === 'details-sync') output(await syncDetails(paths, {
-    startDate:args.from,endDate:args.to,timeZone:args.timezone,maxCalls:args['max-calls'],refresh:args.refresh,
+    startDate:args.from,endDate:args.to,timeZone:args.timezone,maxCalls:args['max-calls'],refresh:args.refresh,refreshTools:args['refresh-tools'],
     onProgress: state => { if((state.completed+state.failed)%10===0) process.stderr.write(JSON.stringify({progress:state})+'\n'); },
   }));
   else if (command === 'details-schema') output(readDetails(paths,{schema:true}));

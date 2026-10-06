@@ -75,7 +75,12 @@ For morning reports, check `missing_latest_metrics` and `metric_data_through`,
 not only the aggregate date or successful tool calls. Watch data may arrive late;
 never relabel yesterday's sleep/HRV as today's. `sleep_minutes` is dedicated Main
 Sleep (excluding awake time); `sleep_window_minutes` is the daily summary window
-including awake time. Keep them distinct and prefer per-metric dedicated sources.
+including awake time (dedicated main-sleep period takes priority when supplied).
+Keep them distinct and check `metric_sources` and `sleep_metrics_scope`; daily
+awake metrics may include naps and must not be treated as main-episode-only.
+Network wellness sync refreshes the official tool catalog and preserves successful
+responses even when another tool fails. Disclose `tools_failed` and `partial`;
+cached values do not establish a successful refresh. Offline reads stay offline.
 Use `wellness-trend.report` for today's briefing: `ready=false` means the requested
 day is incomplete (also after a local midnight without another sync). Report only
 present `report.metrics`, label missing items as pending sync, and never substitute

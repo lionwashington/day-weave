@@ -24,6 +24,7 @@ export function sanitize(value) {
   return value;
 }
 export const DATASETS = {
+  querySleepOverview: {kind:'sleep',semantics:'wake-up date; Main Sleep (asleep) excludes awake; Daily Sleep includes naps; period includes awake; scope and local windows retained'},
   querySleepHrv: {kind:'sleep_hrv',semantics:'wake-up date; official assessment plus raw samples; never average samples to replace assessment'},
   querySleepData: {kind:'sleep',semantics:'wake-up date; Main Sleep excludes awake; windows and naps retained'},
   queryDailyHealthData: {kind:'daily',semantics:'COROS local date; Total sleep includes awake; recent-window query'},
