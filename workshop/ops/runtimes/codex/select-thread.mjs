@@ -68,8 +68,15 @@ try {
   let fresh = false
   if (requestedThreadId) {
     try {
-      const checked = await request('thread/read', { threadId: requestedThreadId, includeTurns: false }, resumeTimeoutMs)
-      if (checked.thread.cwd !== cwd) throw new Error('saved thread belongs to another workspace')
+      try {
+        const checked = await request('thread/read', { threadId: requestedThreadId, includeTurns: false }, resumeTimeoutMs)
+        if (checked.thread.cwd !== cwd) throw new Error('saved thread belongs to another workspace')
+      } catch (error) {
+        // A cold App Server may only read loaded threads. Resume the exact
+        // saved ID from disk instead; an unloaded thread is not a missing one.
+        const rpc = error.rpcError
+        if (rpc?.code !== -32600 || rpc.message !== `thread not loaded: ${requestedThreadId}`) throw error
+      }
       const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
       thread = resumed.thread
       if (thread.cwd !== cwd) throw new Error('saved thread belongs to another workspace')

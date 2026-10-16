@@ -75,6 +75,31 @@ reposts the same runtime identity without that flag. Channel promotes the existi
 client with `thread/resume`, preserving the active WebSocket and enabling delta
 notifications used by platform streaming.
 
+### Codex cold startup and launch confirmation
+
+An App Server can return `thread not loaded: <id>` when the selector reads a
+saved thread before resuming it. Only that exact `-32600` response permits the
+selector to continue with `thread/resume` for the same ID. The resumed cwd must
+still match. An unloaded thread is not a missing thread: only a definitive
+missing implicit owner permits latest-thread selection or a fresh TUI session.
+Explicit missing IDs, transport failures, timeouts and workspace mismatches
+remain errors.
+
+The Codex `runtime::post_launch` hook waits for stable TUI readiness using
+`wait-ready.sh` before `start` reports success. This also validates an existing
+pane without restarting it. A missing/dead pane, failed creation, hook failure
+or readiness timeout returns nonzero instead of `launched`. A retained dead
+pane's ready-looking screen does not count as readiness. Set
+`KA_WORKSHOP_START_TIMEOUT` to a positive integer to override the default
+60-second timeout. `--dry-run` does not wait. Channel registration and KB
+availability are not prerequisites for TUI readiness.
+
+Regression checks:
+
+```sh
+node --test tests/workshop-thread-selection.test.mjs tests/workshop-start.test.mjs
+```
+
 ### Slow Codex registration and retries
 
 The registrar's short HTTP timeout does not cancel the daemon's background

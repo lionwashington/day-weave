@@ -71,6 +71,11 @@ for arg in "$@"; do
     prev_arg="$arg"
 done
 
+case "$TIMEOUT:$STABLE_SEC" in
+    *[!0-9:]*|:*|*:) log_err "timeout and stable must be non-negative integers"; exit 2 ;;
+esac
+[ "$TIMEOUT" -gt 0 ] || { log_err "timeout must be positive"; exit 2; }
+
 CONFIG="$(resolve_workshop_config)"
 if [ -z "$SESSION" ]; then
     if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
@@ -111,6 +116,16 @@ prev_sig=""
 stable_since=0
 
 while :; do
+    # A detached tmux pane may disappear immediately after creation, or retain
+    # a stale ready-looking screen with remain-on-exit enabled. Neither is ready.
+    if ! pane_dead="$("$TMUX_BIN" display-message -p -t "$TARGET" '#{pane_dead}' 2>/dev/null)"; then
+        log_err "pane $TARGET disappeared before runtime readiness"
+        exit 3
+    fi
+    if [ "$pane_dead" = "1" ]; then
+        log_err "pane $TARGET exited before runtime readiness"
+        exit 3
+    fi
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
     if [ "$elapsed" -ge "$TIMEOUT" ]; then
