@@ -51,10 +51,16 @@ elif cmd=='display-message':
  elif fmt=='#{pane_dead}':
   p=root/'polls'; count=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(count))
   print('1' if scenario in ['dead','existing-dead'] or (scenario=='ready-then-exit' and count>1) else '0')
+elif cmd=='show-options':
+ if args[-1]=='@ka_codex_tui_state':
+  if scenario=='fallback-shell': print('exited')
+  elif scenario=='starting-with-prompt': print('starting')
 elif cmd=='capture-pane':
  p=root/'captures';count=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(count))
  ready=scenario not in ['timeout','existing-timeout'] and (scenario!='delayed' or count>1)
- print('? for shortcuts' if ready else 'Starting Codex...')
+ if scenario=='update-dialog': print('? for shortcuts\\n  Update available · synthetic-old → synthetic-new\\nenter continue · esc skip')
+ elif scenario=='legacy-fallback-shell': print('? for shortcuts\\n[start-pane:test-mate] Codex TUI exited with status 1')
+ else: print('? for shortcuts' if ready else 'Starting Codex...')
 `, { mode: 0o755 })
   if (scenario.startsWith('existing-') || ['split-error', 'sibling-window'].includes(scenario)) writeFileSync(join(root, 'created'), '')
   const invoke = (...args) => {
@@ -83,7 +89,7 @@ for (const scenario of ['ready', 'delayed', 'existing-ready']) {
   }
 }
 
-for (const scenario of ['dead', 'vanished', 'no-pane', 'creation-error', 'split-error', 'timeout', 'ready-then-exit', 'existing-dead', 'existing-timeout']) {
+for (const scenario of ['dead', 'vanished', 'no-pane', 'creation-error', 'split-error', 'timeout', 'ready-then-exit', 'existing-dead', 'existing-timeout', 'fallback-shell', 'legacy-fallback-shell', 'update-dialog', 'starting-with-prompt']) {
   test(`workshop start rejects ${scenario}; no successful launch is reported`, () => {
     const f = fixture(scenario)
     try {
@@ -132,11 +138,16 @@ test('a stopped Channel is a warning, not a Codex startup dependency', () => {
 test('readiness timeout rejects invalid values before polling', () => {
   const f = fixture('ready')
   try {
-    f.env.KA_WORKSHOP_START_TIMEOUT = 'invalid'
-    const r = f.invoke('start', 'test-mate', '--skip-daemon')
-    assert.notEqual(r.status, 0, r.output)
-    assert.match(r.output, /timeout and stable must be non-negative integers/)
-    assert.doesNotMatch(r.output, /start: launched/)
+    for (const value of ['invalid', '1:2']) {
+      f.env.KA_WORKSHOP_START_TIMEOUT = value
+      const r = f.invoke('start', 'test-mate', '--skip-daemon')
+      assert.notEqual(r.status, 0, r.output)
+      assert.match(r.output, /timeout and stable must be non-negative integers/)
+      assert.doesNotMatch(r.output, /start: launched/)
+    }
+    const r = spawnSync('/bin/bash', [join(f.home, 'workshop/ops/wait-ready.sh'), '--stable', '1:2'], { env: f.env, encoding: 'utf8' })
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /timeout and stable must be non-negative integers/)
   } finally { f.close() }
 })
 
@@ -170,5 +181,10 @@ test('real tmux rejects dead ready-looking screens and confirms a live Codex scr
       assert.equal(r.status, dead ? 3 : 0, r.stdout + r.stderr)
       assert.match(r.stderr, dead ? /exited before runtime readiness/ : /ready \(/)
     }
+    const fallback = realTmux('new-window', '-d', '-P', '-F', '#{pane_id}', '-t', 'isolated', "printf '? for shortcuts\\n'; sleep 60").stdout.trim()
+    assert.equal(realTmux('set-option', '-p', '-t', fallback, '@ka_codex_tui_state', 'exited').status, 0)
+    const r = spawnSync('/bin/bash', [join(f.home, 'workshop/ops/wait-ready.sh'), '--target', fallback, '--timeout', '4'], { env: f.env, encoding: 'utf8', timeout: 8000 })
+    assert.equal(r.status, 3, r.stdout + r.stderr)
+    assert.match(r.stderr, /Codex TUI.*exited before runtime readiness/)
   } finally { realTmux('kill-server'); f.close() }
 })

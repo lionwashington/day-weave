@@ -71,9 +71,11 @@ for arg in "$@"; do
     prev_arg="$arg"
 done
 
-case "$TIMEOUT:$STABLE_SEC" in
-    *[!0-9:]*|:*|*:) log_err "timeout and stable must be non-negative integers"; exit 2 ;;
-esac
+for value in "$TIMEOUT" "$STABLE_SEC"; do
+    case "$value" in
+        ''|*[!0-9]*) log_err "timeout and stable must be non-negative integers"; exit 2 ;;
+    esac
+done
 [ "$TIMEOUT" -gt 0 ] || { log_err "timeout must be positive"; exit 2; }
 
 CONFIG="$(resolve_workshop_config)"
@@ -126,6 +128,15 @@ while :; do
         log_err "pane $TARGET exited before runtime readiness"
         exit 3
     fi
+    if [ "$RUNTIME" = "codex" ]; then
+        tui_state="$("$TMUX_BIN" show-options -p -v -t "$TARGET" @ka_codex_tui_state 2>/dev/null || true)"
+        if [ "$tui_state" = "exited" ]; then
+            log_err "Codex TUI in $TARGET exited before runtime readiness (App Server may remain available)"
+            exit 3
+        fi
+    else
+        tui_state=""
+    fi
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
     if [ "$elapsed" -ge "$TIMEOUT" ]; then
@@ -141,7 +152,7 @@ while :; do
     # and exits 1 when no signal is found.
     matched=""
     ready_sig=0
-    if matched="$(runtime::ready_match "$content")"; then
+    if [ "$tui_state" != "starting" ] && matched="$(runtime::ready_match "$content")"; then
         ready_sig=1
     fi
 
