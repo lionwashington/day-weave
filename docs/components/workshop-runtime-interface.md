@@ -75,6 +75,49 @@ reposts the same runtime identity without that flag. Channel promotes the existi
 client with `thread/resume`, preserving the active WebSocket and enabling delta
 notifications used by platform streaming.
 
+Default selection queries App Server `thread/list` with the mate's exact cwd,
+ordered by `recency_at` descending. The runtime `state/codex-app-servers/<mate>.thread`
+file is output-only: it records the selected ID for consumers such as distillation,
+but never pins the next startup. An old or missing record cannot override latest.
+Keep each mate's persistent sessions in its own cwd. Creating and persisting a
+new session in that cwd makes it eligible on the next startup without editing
+Workshop configuration. Explicit `resume <id>` remains an intentional override;
+lookup errors or cwd mismatches fail closed rather than silently switching sessions.
+The TUI and Channel registrar use the same selected ID for each startup. Switching
+threads inside an already-running TUI is not a live Channel rebind mechanism.
+
+### Codex cold startup and launch confirmation
+
+An App Server can return `thread not loaded: <id>` when the selector reads a
+saved thread before resuming it. Only that exact `-32600` response permits the
+selector to continue with `thread/resume` for the same ID. The resumed cwd must
+still match. An unloaded thread is not a missing thread. Default selection uses
+the latest exact-cwd thread and does not read a saved implicit owner.
+Explicit missing IDs, transport failures, timeouts and workspace mismatches
+remain errors.
+
+The Codex `runtime::post_launch` hook waits for stable TUI readiness using
+`wait-ready.sh` before `start` reports success. This also validates an existing
+pane without restarting it. A missing/dead pane, failed creation, hook failure
+or readiness timeout returns nonzero instead of `launched`. A retained dead
+pane's ready-looking screen does not count as readiness. Set
+`KA_WORKSHOP_START_TIMEOUT` to a positive integer to override the default
+60-second timeout. `--dry-run` does not wait. Channel registration and KB
+availability are not prerequisites for TUI readiness.
+
+The wrapper records `starting`, `running`, or `exited` in the pane option
+`@ka_codex_tui_state`. An exited TUI is not ready even if its App Server and
+fallback shell remain alive. Upgrade confirmation dialogs and legacy wrapper
+exit messages cannot satisfy readiness through residual prompt text. This adds
+no daemon or background process; panes launched before this marker was added
+remain compatible through the existing screen signals.
+
+Regression checks:
+
+```sh
+node --test tests/workshop-thread-selection.test.mjs tests/workshop-start.test.mjs
+```
+
 ### Slow Codex registration and retries
 
 The registrar's short HTTP timeout does not cancel the daemon's background

@@ -336,32 +336,26 @@ cmd_start() {
 
     log_ts "ka workshop start: launching ${#ENTRY_NAMES[@]} agent(s) in session '$SESSION' [layout=$LAYOUT]$([ "${skipped_optional:-0}" -gt 0 ] && printf ' (skipped %s optional mate; --all to include)' "$skipped_optional")"
 
-    # Idempotency keys per layout: pane → @ka_channel user-option; window → index.
-    local existing_channels="" existing_windows=""
+    # Runtime identity is the channel in either layout, not a window index.
+    local existing_channels=""
     if [ "$session_exists" = "1" ] && [ "$DRY_RUN" != "1" ]; then
-        if [ "$LAYOUT" = "pane" ]; then
-            existing_channels="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{@ka_channel}' 2>/dev/null || true)"
-        else
-            existing_windows="$("$TMUX_BIN" list-windows -t "$SESSION" -F '#{window_index}' 2>/dev/null || true)"
-        fi
+        existing_channels="$("$TMUX_BIN" list-panes -s -t "$SESSION" -F '#{@ka_channel}' 2>/dev/null || true)"
     fi
 
     local made_any=0
-    declare -a CONFIRM_PANES CONFIRM_NAMES CONFIRM_RUNTIMES
+    declare -a CONFIRM_PANES=() CONFIRM_NAMES=() CONFIRM_RUNTIMES=()
     local name cwd channel runtime args cmd new_pane_id
     for i in "${!ENTRY_NAMES[@]}"; do
         name="${ENTRY_NAMES[$i]}"; cwd="${ENTRY_CWDS[$i]}"
         channel="${ENTRY_CHANNELS[$i]}"; args="${ENTRY_ARGS[$i]}"
         runtime="${ENTRY_RUNTIMES[$i]}"
 
-        if [ "$LAYOUT" = "pane" ]; then
-            if printf '%s\n' "$existing_channels" | grep -qx "$channel"; then
-                log_ts "Pane for '$name' (channel '$channel') exists — already running, skipping."; continue
-            fi
-        else
-            if printf '%s\n' "$existing_windows" | grep -qx "$i"; then
-                log_ts "Window $i ($name) exists — already running, skipping."; continue
-            fi
+        if printf '%s\n' "$existing_channels" | grep -qx "$channel"; then
+            new_pane_id="$(find_pane_by_channel "$channel" || true)"
+            [ -n "$new_pane_id" ] || { log_err "pane for '$name' disappeared during startup"; return 1; }
+            CONFIRM_PANES+=("$new_pane_id"); CONFIRM_NAMES+=("$name"); CONFIRM_RUNTIMES+=("$runtime")
+            log_ts "Pane for '$name' (channel '$channel') exists; checking runtime without restarting."
+            continue
         fi
 
         cmd="$(build_channel_cmd "$runtime" "$name" "$cwd" "$channel" "$args")"
@@ -373,7 +367,7 @@ cmd_start() {
                     echo "[dry-run] $TMUX_BIN new-session -d -x $TMUX_DETACHED_WIDTH -y $TMUX_DETACHED_HEIGHT -s $SESSION -n $SESSION -c $cwd -- <start-pane: $name>"
                 else
                     "$TMUX_BIN" new-session -d -x "$TMUX_DETACHED_WIDTH" -y "$TMUX_DETACHED_HEIGHT" -s "$SESSION" -n "$SESSION" -c "$cwd" "$cmd"
-                    new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1)"
+                    new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
                 fi
             else
                 log_ts "Adding split-pane to window 0 for $name (channel '$channel') at $cwd"
@@ -384,7 +378,7 @@ cmd_start() {
                     # `start <name>` for a single mate), create it first.
                     if ! "$TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; then
                         "$TMUX_BIN" new-session -d -x "$TMUX_DETACHED_WIDTH" -y "$TMUX_DETACHED_HEIGHT" -s "$SESSION" -n "$SESSION" -c "$cwd" "$cmd"
-                        new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1)"
+                        new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
                     else
                         new_pane_id="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$SESSION:0" -c "$cwd" "$cmd" 2>/dev/null || true)"
                         "$TMUX_BIN" select-layout -t "$SESSION:0" tiled >/dev/null 2>&1 || true
@@ -398,7 +392,7 @@ cmd_start() {
                     echo "[dry-run] $TMUX_BIN new-session -d -x $TMUX_DETACHED_WIDTH -y $TMUX_DETACHED_HEIGHT -s $SESSION -n $name -c $cwd -- <start-pane: $name>"
                 else
                     "$TMUX_BIN" new-session -d -x "$TMUX_DETACHED_WIDTH" -y "$TMUX_DETACHED_HEIGHT" -s "$SESSION" -n "$name" -c "$cwd" "$cmd"
-                    new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1)"
+                    new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
                 fi
             else
                 log_ts "Creating window $i ($name → channel '$channel') at $cwd"
@@ -407,7 +401,7 @@ cmd_start() {
                 else
                     if ! "$TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; then
                         "$TMUX_BIN" new-session -d -x "$TMUX_DETACHED_WIDTH" -y "$TMUX_DETACHED_HEIGHT" -s "$SESSION" -n "$name" -c "$cwd" "$cmd"
-                        new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1)"
+                        new_pane_id="$("$TMUX_BIN" list-panes -t "$SESSION:0" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
                     else
                         new_pane_id="$("$TMUX_BIN" new-window -d -P -F '#{pane_id}' -t "$SESSION" -n "$name" -c "$cwd" "$cmd" 2>/dev/null || true)"
                     fi
@@ -420,6 +414,9 @@ cmd_start() {
             CONFIRM_PANES+=("$new_pane_id"); CONFIRM_NAMES+=("$name"); CONFIRM_RUNTIMES+=("$runtime")
         elif [ "$DRY_RUN" = "1" ]; then
             echo "[dry-run] would run $runtime post-launch hook for $name"
+        else
+            log_err "failed to create runtime pane for '$name'"
+            return 1
         fi
         made_any=1
     done
@@ -435,9 +432,12 @@ cmd_start() {
     if [ "$DRY_RUN" != "1" ] && [ "${#CONFIRM_PANES[@]}" -gt 0 ]; then
         local ci
         for ci in "${!CONFIRM_PANES[@]}"; do
-            runtime_load "${CONFIRM_RUNTIMES[$ci]}" || continue
+            runtime_load "${CONFIRM_RUNTIMES[$ci]}" || return 1
             if runtime_has runtime::post_launch; then
-                runtime::post_launch "${CONFIRM_PANES[$ci]}" "${CONFIRM_NAMES[$ci]}"
+                if ! runtime::post_launch "${CONFIRM_PANES[$ci]}" "${CONFIRM_NAMES[$ci]}"; then
+                    log_err "runtime startup failed for '${CONFIRM_NAMES[$ci]}' — no successful launch confirmed"
+                    return 1
+                fi
             fi
         done
     fi

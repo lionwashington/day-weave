@@ -32,6 +32,12 @@ if ! command -v codex >/dev/null 2>&1; then
     exec "${SHELL:-/bin/zsh}" -l
 fi
 
+set_tui_state() {
+    [ -n "${TMUX_PANE:-}" ] || return 0
+    "${TMUX_BIN:-tmux}" set-option -p -t "$TMUX_PANE" @ka_codex_tui_state "$1" 2>/dev/null || true
+}
+set_tui_state starting
+
 # Workshop owns both processes for a Codex mate. The App Server is a sidecar
 # bound to a per-mate loopback WebSocket; the TUI and Channel daemon are clients. The
 # registrar retries while the pane is alive so a later Channel start/restart is
@@ -225,7 +231,7 @@ fi
 
 THREAD_SELECTOR="${KA_CODEX_THREAD_SELECTOR:-$KA_RUNTIMES_DIR/codex/select-thread.mjs}"
 THREAD_OWNER_FILE="$SOCKET_DIR/$SAFE_NAME.thread"
-export KA_CODEX_THREAD_OWNER_FILE="$THREAD_OWNER_FILE"
+# Output-only runtime record; selection defaults to the latest exact-cwd thread.
 THREAD_JSON="$(node "$THREAD_SELECTOR" "$APP_SERVER_ENDPOINT" "$EXPECTED_CWD" "$REQUESTED_THREAD_ID" select)" || {
     echo "[start-pane:$PANE_NAME] ERROR: cannot select canonical Codex thread"
     exit 1
@@ -234,7 +240,6 @@ FRESH_THREAD="$(printf '%s' "$THREAD_JSON" | node -e 'let s="";process.stdin.on(
 
 persist_thread_owner() {
     local thread_id="$1" owner_tmp
-    [ -n "$REQUESTED_THREAD_ID" ] && return 0
     owner_tmp="$THREAD_OWNER_FILE.$$"
     printf '%s\n' "$thread_id" > "$owner_tmp"
     chmod 600 "$owner_tmp" 2>/dev/null || true
@@ -308,6 +313,7 @@ if [ "$FRESH_THREAD" = "1" ]; then
     # stale terminal modes through stderr on exit, overriding the foreground TUI.
     discover_and_register_fresh_thread </dev/null >>"$SERVER_LOG" 2>&1 &
     REGISTRAR_PID=$!
+    set_tui_state running
     run_codex "${TUI_ARGS[@]}"
     TUI_STATUS=$?
 else
@@ -329,10 +335,12 @@ else
     done
     TUI_ARGS=("${RESUME_ARGS[@]}")
     echo "[start-pane:$PANE_NAME] codex ${TUI_ARGS[*]} resume $CANONICAL_THREAD_ID (Workshop-managed App Server)"
+    set_tui_state running
     run_codex "${TUI_ARGS[@]}" resume "$CANONICAL_THREAD_ID"
     TUI_STATUS=$?
 fi
 set -e
+set_tui_state exited
 printf '[start-pane:%s] Codex TUI exited with status %s\n' "$PANE_NAME" "$TUI_STATUS" | tee -a "$SERVER_LOG" >&2
 # A Channel-owned turn runs in the App Server, not in the TUI. Keep the
 # sidecar alive if the TUI exits so a long Telegram/Lark turn is not killed

@@ -121,6 +121,17 @@ registration after its rollout becomes resumable. This transition is what enable
 Telegram/Lark text deltas for a brand-new session. Restarting Channel does not
 require restarting the Codex pane; the registration loop converges again.
 
+For saved threads that a cold App Server reports as not loaded, Workshop tries
+to resume the exact saved ID and validates its cwd. It does not treat that
+response as evidence that the session is missing.
+
+Codex startup reports success only after stable TUI readiness, including when
+checking an already-existing pane. Pane exit or readiness timeout returns a
+nonzero exit status, even if tmux initially accepted the launch. The default
+timeout is 60 seconds; override it with `KA_WORKSHOP_START_TIMEOUT=<seconds>`.
+`--dry-run` does not wait. Neither KB nor an online Channel daemon is required
+for the Codex TUI to start.
+
 ### Examples
 
 ```bash

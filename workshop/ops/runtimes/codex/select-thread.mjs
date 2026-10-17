@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from 'node:fs'
-
 const [endpoint, cwd, explicitThreadId = '', mode = 'select'] = process.argv.slice(2)
-const ownerFile = process.env.KA_CODEX_THREAD_OWNER_FILE
-const requestedThreadId = explicitThreadId || (mode === 'select' && ownerFile && existsSync(ownerFile)
-  ? readFileSync(ownerFile, 'utf8').trim() : '')
+// Runtime .thread files record the selected session; they are not resume pins.
+const requestedThreadId = explicitThreadId
 if (!endpoint || !cwd) throw new Error('usage: select-thread.mjs <endpoint> <cwd> [thread-id]')
 if (!['select', 'wait'].includes(mode)) throw new Error(`invalid selection mode: ${mode}`)
 
@@ -61,7 +58,9 @@ try {
       sortKey: 'recency_at',
       sortDirection: 'desc',
     })
-    return listed.data?.[0]
+    const latest = listed.data?.[0]
+    if (latest && latest.cwd !== cwd) throw new Error('latest thread belongs to another workspace')
+    return latest
   }
 
   let thread
@@ -69,18 +68,15 @@ try {
   if (requestedThreadId) {
     try {
       const checked = await request('thread/read', { threadId: requestedThreadId, includeTurns: false }, resumeTimeoutMs)
-      if (checked.thread.cwd !== cwd) throw new Error('saved thread belongs to another workspace')
-      const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
-      thread = resumed.thread
-      if (thread.cwd !== cwd) throw new Error('saved thread belongs to another workspace')
+      if (checked.thread.cwd !== cwd) throw new Error('requested thread belongs to another workspace')
     } catch (error) {
-      // Only a definitive missing implicit owner may fall back. Explicit IDs,
-      // transport failures, timeouts and workspace mismatches remain errors.
+      // A cold App Server may only read loaded threads. Resume only this exact
+      // unloaded ID; missing IDs and all other errors remain failures.
       const rpc = error.rpcError
-      const missing = rpc?.code === -32600 &&
-        /^(?:no rollout found for thread id|thread not found(?::| for thread id)?)[ :]/i.test(rpc.message ?? '')
-      if (explicitThreadId || !missing) throw error
+      if (rpc?.code !== -32600 || rpc.message !== `thread not loaded: ${requestedThreadId}`) throw error
     }
+    const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
+    thread = resumed.thread
   }
   if (!thread && mode === 'wait') {
     const deadline = Date.now() + 15_000
@@ -98,6 +94,7 @@ try {
       thread = resumed.thread
     }
   }
+  if (thread && thread.cwd !== cwd) throw new Error('resumed thread belongs to another workspace')
   if (fresh) process.stdout.write(`${JSON.stringify({ id: '', path: null, cwd, fresh: true })}\n`)
   else process.stdout.write(`${JSON.stringify({ id: thread.id, path: thread.path ?? null, cwd: thread.cwd, fresh: false })}\n`)
 } finally {

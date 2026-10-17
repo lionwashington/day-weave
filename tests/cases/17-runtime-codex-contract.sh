@@ -99,9 +99,15 @@ JS
 export KA_CODEX_THREAD_SELECTOR="$tmp_root/select-thread.mjs"
 export KA_CODEX_KEEP_APP_SERVER_ON_TUI_EXIT=0
 
-FAKE_CODEX_CALLS="$tmp_root/calls" PATH="$tmp_root/bin:$PATH" KA_HOME="$REPO" KA_CHANNEL=main \
+FAKE_TMUX_CALLS="$tmp_root/tui-states" TMUX_BIN="$tmp_root/bin/fake-tmux" TMUX_PANE='%contract' \
+    FAKE_CODEX_CALLS="$tmp_root/calls" PATH="$tmp_root/bin:$PATH" KA_HOME="$REPO" KA_CHANNEL=main \
     "$OPS/start-pane.sh" codex reviewer "$tmp_root/work" --model test-model >/dev/null 2>&1 \
     || fail "explicit Codex launch failed"
+for state in starting running exited; do
+    grep -qF "set-option -p -t %contract @ka_codex_tui_state $state" "$tmp_root/tui-states" \
+        || fail "Codex wrapper did not record TUI lifecycle state: $state"
+done
+ok "actual Codex wrapper records TUI state independently from retained App Server"
 grep -Eq -- 'mcp_servers\.telegram\.enabled=false .*mcp_servers\.telegram-channel\.url="http://127\.0\.0\.1:1/mcp\?name=main&mode=tools" -c model="test-model" --remote ws://127\.0\.0\.1:[0-9]+ --dangerously-bypass-hook-trust --model test-model resume thread-current-cwd$' "$tmp_root/calls" || fail "Workshop Codex launch is missing Channel MCP, canonical thread, or bypass arguments"
 grep -Eq -- 'mcp_servers\.telegram-channel\.url="http://127\.0\.0\.1:1/mcp\?name=main&mode=tools" -c model="test-model" --dangerously-bypass-hook-trust --dangerously-bypass-approvals-and-sandbox app-server --listen ws://127\.0\.0\.1:[0-9]+$' "$tmp_root/calls" || fail "Workshop App Server did not attach Channel MCP or bypass hook trust and approvals"
 if grep -q -- 'mcp_servers\.knowledge-assistant' "$tmp_root/calls"; then
