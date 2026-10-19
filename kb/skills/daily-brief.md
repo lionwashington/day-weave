@@ -54,7 +54,33 @@ gogcli --no-input -a <calendar_account> calendar events --from <today> --to <tom
 Show: time, title, location. Highlight conflicts.
 
 ### 3. Todos
-Use the `kb_read_topic` MCP tool to read the "todo" topic (or similar). Extract active/urgent items.
+Read the current `todo` board and `rules` through KB. Todo is the sole execution
+state; historical sections and conversation logs do not reactivate tasks.
+When installed, run `node "${KA_HOME:-$HOME/.knowledge-assistant}/kb/ops/todo-plan.mjs" plan` from the personal
+workspace. The command is
+read-only. It returns at most three verified user actions, assistant preparation,
+waiting and deferred groups, plus review issues. Legacy prose stays unverified
+`review_candidates`: verify against the current board and source before proposing
+at most three actions; do not treat an empty structured list as no pending work.
+
+Show priority reason, next action, responsible party and the relevant real
+deadline or explicitly labelled internal preparation target. Waiting tasks only
+escalate at their checkpoint or on newly verified evidence. Do not mark complete
+without confirmation. Do not contact external parties, submit, pay or book.
+
+For upcoming calendar nodes, review materials, travel and conflicts using the
+calendar skill. An optional current private calendar snapshot can be passed with
+`--calendar`; missing/stale snapshots mean not checked. Reminder proposals are
+not executed actions. Preserve existing reminders (including protected course
+series), record IDs to prevent duplicate creation, and only propose cleanup of
+completed-task action reminders, never actual appointments. Ordinary new
+reminders belong in daytime, not before sleep. Never claim automatic follow-up
+unless that scheduling is actually deployed and verified. If the planner is not
+installed, state the fallback and review only the current board manually.
+
+Put “今天最多3件本人行动” before the other brief sections, followed by compact
+“助手待准备 / 等待外部 / 可暂缓”. Do not say “已检查/正在准备” merely because
+something appears in a plan. Do not duplicate this action list later in the brief.
 
 ### 4. Email
 
