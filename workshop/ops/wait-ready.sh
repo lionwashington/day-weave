@@ -26,6 +26,7 @@
 #   0  pane is ready
 #   1  timeout waiting for ready state
 #   3  config/session/pane not found (hard misconfig, not just "not ready yet")
+#   4  Codex update modal (caller may explicitly opt into restart-time recovery)
 #
 # Flags:
 #   --session NAME      override session from workshop.yaml
@@ -47,6 +48,9 @@ TARGET_OVERRIDE=""
 TIMEOUT=60
 STABLE_SEC=2
 VERBOSE=0
+APP_SERVER_ENDPOINT=""
+APP_SERVER_NAME=""
+EXPECTED_VERSION=""
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
@@ -58,6 +62,9 @@ for arg in "$@"; do
         --target)    : ;;
         --stable=*)  STABLE_SEC="${arg#--stable=}" ;;
         --stable)    : ;;
+        --app-server-endpoint) : ;;
+        --app-server-name) : ;;
+        --expected-version) : ;;
         --verbose|-v) VERBOSE=1 ;;
         *)
             case "$prev_arg" in
@@ -65,6 +72,9 @@ for arg in "$@"; do
                 --session) SESSION="$arg" ;;
                 --target)  TARGET_OVERRIDE="$arg" ;;
                 --stable)  STABLE_SEC="$arg" ;;
+                --app-server-endpoint) APP_SERVER_ENDPOINT="$arg" ;;
+                --app-server-name) APP_SERVER_NAME="$arg" ;;
+                --expected-version) EXPECTED_VERSION="$arg" ;;
             esac
             ;;
     esac
@@ -116,6 +126,7 @@ log_info "waiting for $TARGET to be ready (timeout=${TIMEOUT}s, stable=${STABLE_
 start_ts=$(date +%s)
 prev_sig=""
 stable_since=0
+last_probe="not_attempted"
 
 while :; do
     # A detached tmux pane may disappear immediately after creation, or retain
@@ -140,11 +151,19 @@ while :; do
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
     if [ "$elapsed" -ge "$TIMEOUT" ]; then
-        log_err "timeout after ${TIMEOUT}s — $TARGET never reached ready state"
+        log_err "timeout after ${TIMEOUT}s — $TARGET never reached ready state (App Server probe: $last_probe)"
         exit 1
     fi
 
     content="$(capture)"
+    if [ "$RUNTIME" = "codex" ] && codex::hook_review_match "$content"; then
+        log_err "Codex hook review is required in $TARGET; inspect /hooks and reviewed source changes before restarting this mate"
+        exit 3
+    fi
+    if [ "$RUNTIME" = "codex" ] && codex::update_prompt_match "$content"; then
+        log_err "Codex update choice is required in $TARGET (not ready)"
+        exit 4
+    fi
     sig="$(printf '%s' "$content" | cksum | awk '{print $1 "-" $2}')"
 
     # Delegate signal detection to the runtime adapter (phase 2). The adapter
@@ -154,6 +173,33 @@ while :; do
     ready_sig=0
     if [ "$tui_state" != "starting" ] && matched="$(runtime::ready_match "$content")"; then
         ready_sig=1
+    fi
+    if [ "$ready_sig" = "1" ] && [ "$RUNTIME" = "codex" ] && { [ -n "$APP_SERVER_ENDPOINT" ] || [ -n "$APP_SERVER_NAME" ]; }; then
+        if [ -z "$APP_SERVER_ENDPOINT" ]; then
+            APP_SERVER_ENDPOINT="$("$TMUX_BIN" show-options -p -v -t "$TARGET" @ka_codex_app_server_endpoint 2>/dev/null || true)"
+            if [ -z "$APP_SERVER_ENDPOINT" ]; then
+                channel="$("$TMUX_BIN" show-options -p -v -t "$TARGET" @ka_channel 2>/dev/null || true)"
+                channel="$(printf '%s' "${channel:-$APP_SERVER_NAME}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')"
+                # A newly starting wrapper may not have created its log yet.
+                # Missing metadata/log is pending, not a set -e/pipefail exit.
+                APP_SERVER_ENDPOINT="$(tail -40 "$KA_STATE_DIR/codex-app-servers/$channel.log" 2>/dev/null | sed -n 's/.*listening on: \(ws:\/\/127\.0\.0\.1:[0-9][0-9]*\).*/\1/p' | tail -1 || true)"
+            fi
+        fi
+        if [ -z "$APP_SERVER_ENDPOINT" ]; then
+            last_probe='{"ok":false,"reason":"endpoint_pending"}'
+            ready_sig=0
+        else
+            probe="${KA_CODEX_READY_PROBE:-$KA_RUNTIMES_DIR/codex/probe-ready.mjs}"
+            if last_probe="$(node "$probe" "$APP_SERVER_ENDPOINT" "$EXPECTED_VERSION" 1000)"; then
+                matched="${matched}+app-server"
+            else
+                ready_sig=0
+                if printf '%s' "$last_probe" | grep -q '"reason":"version_mismatch"'; then
+                    log_err "App Server probe: $last_probe — restart this mate to load the installed Codex version"
+                    exit 3
+                fi
+            fi
+        fi
     fi
 
     if [ "$VERBOSE" = "1" ]; then

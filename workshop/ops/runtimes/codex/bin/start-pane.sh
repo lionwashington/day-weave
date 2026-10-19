@@ -32,11 +32,20 @@ if ! command -v codex >/dev/null 2>&1; then
     exec "${SHELL:-/bin/zsh}" -l
 fi
 
+# Resolve once: an installer may replace the public symlink while this pane
+# boots. Both processes must execute the same selected release.
+CODEX_LAUNCH_BIN="$(node -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "$(command -v codex)")" || exit 1
+CODEX_LAUNCH_VERSION="$("$CODEX_LAUNCH_BIN" --version)" || { echo "[start-pane:$PANE_NAME] ERROR: selected Codex executable failed its version check" >&2; exit 1; }
+[[ "$CODEX_LAUNCH_VERSION" =~ ^codex-cli[[:space:]][0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]] || { echo "[start-pane:$PANE_NAME] ERROR: selected Codex executable returned an invalid version" >&2; exit 1; }
+
 set_tui_state() {
     [ -n "${TMUX_PANE:-}" ] || return 0
     "${TMUX_BIN:-tmux}" set-option -p -t "$TMUX_PANE" @ka_codex_tui_state "$1" 2>/dev/null || true
 }
 set_tui_state starting
+if [ -n "${TMUX_PANE:-}" ]; then
+    "${TMUX_BIN:-tmux}" set-option -p -t "$TMUX_PANE" @ka_codex_version "${CODEX_LAUNCH_VERSION#codex-cli }" 2>/dev/null || true
+fi
 
 # Workshop owns both processes for a Codex mate. The App Server is a sidecar
 # bound to a per-mate loopback WebSocket; the TUI and Channel daemon are clients. The
@@ -51,6 +60,7 @@ RUNTIME_NAME="${KA_CHANNEL:-$PANE_NAME}"
 SAFE_NAME="$(printf '%s' "$RUNTIME_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')"
 [ -n "$SAFE_NAME" ] || SAFE_NAME="main"
 SERVER_LOG="$SOCKET_DIR/$SAFE_NAME.log"
+printf '[start-pane:%s] selected %s\n' "$PANE_NAME" "$CODEX_LAUNCH_VERSION" >> "$SERVER_LOG"
 INSTANCE_LOCK_DIR="$SOCKET_DIR/$SAFE_NAME.instance.lock"
 INSTANCE_OWNER_FILE="$INSTANCE_LOCK_DIR/pid"
 PORT_LOCK_DIR="$SOCKET_DIR/.port-allocation.lock"
@@ -103,27 +113,6 @@ for _ in 1 2 3; do
 done
 [ "$INSTANCE_LOCK_HELD" = "1" ] || { echo "[start-pane:$PANE_NAME] ERROR: cannot acquire Codex runtime instance lock for '$SAFE_NAME'" >&2; exit 1; }
 
-# Port discovery closes its temporary listener before App Server binds. Serialize
-# that small gap across Workshop panes so simultaneous Codex mates cannot select
-# the same ephemeral port.
-for _ in $(seq 1 200); do
-    if mkdir "$PORT_LOCK_DIR" 2>/dev/null; then
-        printf '%s\n' "$$" > "$PORT_LOCK_DIR/pid"
-        PORT_LOCK_HELD=1
-        break
-    fi
-    lock_pid="$(cat "$PORT_LOCK_DIR/pid" 2>/dev/null || true)"
-    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-        rm -f "$PORT_LOCK_DIR/pid"
-        rmdir "$PORT_LOCK_DIR" 2>/dev/null || true
-    fi
-    sleep 0.05
-done
-[ "$PORT_LOCK_HELD" = "1" ] || { echo "[start-pane:$PANE_NAME] ERROR: timed out allocating App Server port"; exit 1; }
-
-APP_SERVER_PORT="$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
-APP_SERVER_ENDPOINT="ws://127.0.0.1:$APP_SERVER_PORT"
-
 # The legacy Telegram MCP may use the same bot identity as Channel and race its
 # getUpdates consumer. Replace that one transport with a disabled valid stdio
 # entry for both App Server and remote TUI invocations; the user's Codex
@@ -157,17 +146,52 @@ done
 if [ -n "$KA_CODEX_MODEL" ]; then
     CODEX_MCP_OVERRIDES+=(-c "model=$(node -e 'process.stdout.write(JSON.stringify(process.env.KA_CODEX_MODEL))')")
 fi
-# The sidecar must never inherit the pane's stdin. This shell runs without job
-# control, so a background App Server otherwise shares the foreground process
-# group with the TUI and can consume terminal replies or keystrokes.
-codex "${CODEX_MCP_OVERRIDES[@]}" \
+# Remote resume may ignore the TUI hook-bypass flag. Implement the launcher's
+# existing invocation-only bypass intent using exact hashes reported by Codex.
+# Never persist trust, enable disabled hooks, or hold the port lock during this
+# bounded, short-lived discovery. Reuse the executable selected for this launch.
+HOOK_TRUST_OVERRIDE="$(KA_CODEX_LAUNCH_BIN="$CODEX_LAUNCH_BIN" node "$KA_RUNTIMES_DIR/codex/hook-trust-overrides.mjs" "$EXPECTED_CWD" -- "${CODEX_MCP_OVERRIDES[@]}")" || {
+    echo "[start-pane:$PANE_NAME] ERROR: cannot resolve invocation-local hook trust" >&2
+    exit 1
+}
+[ -z "$HOOK_TRUST_OVERRIDE" ] || CODEX_MCP_OVERRIDES+=(-c "$HOOK_TRUST_OVERRIDE")
+
+# Serialize only ephemeral port discovery through binding, not hook discovery.
+for _ in $(seq 1 200); do
+    if mkdir "$PORT_LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$PORT_LOCK_DIR/pid"
+        PORT_LOCK_HELD=1
+        break
+    fi
+    lock_pid="$(cat "$PORT_LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f "$PORT_LOCK_DIR/pid"
+        rmdir "$PORT_LOCK_DIR" 2>/dev/null || true
+    fi
+    sleep 0.05
+done
+[ "$PORT_LOCK_HELD" = "1" ] || { echo "[start-pane:$PANE_NAME] ERROR: timed out allocating App Server port"; exit 1; }
+APP_SERVER_PORT="$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
+APP_SERVER_ENDPOINT="ws://127.0.0.1:$APP_SERVER_PORT"
+if [ -n "${TMUX_PANE:-}" ]; then
+    "${TMUX_BIN:-tmux}" set-option -p -t "$TMUX_PANE" @ka_codex_app_server_endpoint "$APP_SERVER_ENDPOINT" 2>/dev/null || true
+fi
+
+# Drop the sidecar's controlling terminal as well as all stdio descriptors.
+# exec keeps its PID and Workshop process group, so existing verified stopping
+# still reaches every child. No persistent Python process/supervisor is added.
+python3 "$KA_RUNTIMES_DIR/codex/exec-without-tty.py" "$CODEX_LAUNCH_BIN" "${CODEX_MCP_OVERRIDES[@]}" \
     --dangerously-bypass-hook-trust \
     --dangerously-bypass-approvals-and-sandbox \
     app-server --listen "$APP_SERVER_ENDPOINT" </dev/null >>"$SERVER_LOG" 2>&1 &
 APP_SERVER_PID=$!
 
+APP_SERVER_LISTEN_READY=0
 for _ in $(seq 1 100); do
-    node -e 'const net=require("net");const s=net.connect(Number(process.argv[1]),"127.0.0.1",()=>{s.end();process.exit(0)});s.on("error",()=>process.exit(1))' "$APP_SERVER_PORT" >/dev/null 2>&1 && break
+    if node -e 'const net=require("net");const s=net.connect(Number(process.argv[1]),"127.0.0.1",()=>{s.end();process.exit(0)});setTimeout(()=>{s.destroy();process.exit(1)},300);s.on("error",()=>process.exit(1))' "$APP_SERVER_PORT" >/dev/null 2>&1; then
+        APP_SERVER_LISTEN_READY=1
+        break
+    fi
     kill -0 "$APP_SERVER_PID" 2>/dev/null || {
         echo "[start-pane:$PANE_NAME] ERROR: Codex App Server exited; see $SERVER_LOG"
         exit 1
@@ -175,6 +199,7 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 kill -0 "$APP_SERVER_PID" 2>/dev/null || { echo "[start-pane:$PANE_NAME] ERROR: App Server did not start"; exit 1; }
+[ "$APP_SERVER_LISTEN_READY" = "1" ] || { echo "[start-pane:$PANE_NAME] ERROR: App Server did not open its listener"; exit 1; }
 release_port_lock
 
 REQUESTED_THREAD_ID=""
@@ -204,7 +229,7 @@ elif [ "${1:-}" = "resume" ] && [ -n "${2:-}" ]; then
 fi
 
 run_codex() {
-    codex "${CODEX_MCP_OVERRIDES[@]}" --remote "$APP_SERVER_ENDPOINT" "$@"
+    "$CODEX_LAUNCH_BIN" "${CODEX_MCP_OVERRIDES[@]}" --remote "$APP_SERVER_ENDPOINT" "$@"
 }
 
 # Workshop panes are unattended runtime processes. Make approval bypass the

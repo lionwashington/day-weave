@@ -45,6 +45,11 @@
 #   OPS_CONFIG       override workshop.yaml path
 set -euo pipefail
 
+# Consume the restart hand-off before creating tmux or pane processes. Never
+# leak permission to upgrade into the tmux server's long-lived environment.
+RESTART_UPGRADE="${KA_CODEX_UPGRADE_ON_RESTART:-0}"
+unset KA_CODEX_UPGRADE_ON_RESTART
+
 : "${KA_HOME:=$HOME/.knowledge-assistant}"
 source "$KA_HOME/shared/ops/common.sh"
 # shellcheck source=../lib/tmux-helpers.sh
@@ -343,7 +348,7 @@ cmd_start() {
     fi
 
     local made_any=0
-    declare -a CONFIRM_PANES=() CONFIRM_NAMES=() CONFIRM_RUNTIMES=()
+    declare -a CONFIRM_PANES=() CONFIRM_NAMES=() CONFIRM_RUNTIMES=() CONFIRM_UPGRADE=()
     local name cwd channel runtime args cmd new_pane_id
     for i in "${!ENTRY_NAMES[@]}"; do
         name="${ENTRY_NAMES[$i]}"; cwd="${ENTRY_CWDS[$i]}"
@@ -354,6 +359,7 @@ cmd_start() {
             new_pane_id="$(find_pane_by_channel "$channel" || true)"
             [ -n "$new_pane_id" ] || { log_err "pane for '$name' disappeared during startup"; return 1; }
             CONFIRM_PANES+=("$new_pane_id"); CONFIRM_NAMES+=("$name"); CONFIRM_RUNTIMES+=("$runtime")
+            CONFIRM_UPGRADE+=(0) # Never upgrade/restart an already-running pane during start.
             log_ts "Pane for '$name' (channel '$channel') exists; checking runtime without restarting."
             continue
         fi
@@ -412,6 +418,7 @@ cmd_start() {
             "$TMUX_BIN" set-option -p -t "$new_pane_id" @ka_channel "$channel" 2>/dev/null || true
             "$TMUX_BIN" set-option -p -t "$new_pane_id" @ka_runtime "$runtime" 2>/dev/null || true
             CONFIRM_PANES+=("$new_pane_id"); CONFIRM_NAMES+=("$name"); CONFIRM_RUNTIMES+=("$runtime")
+            CONFIRM_UPGRADE+=("$RESTART_UPGRADE")
         elif [ "$DRY_RUN" = "1" ]; then
             echo "[dry-run] would run $runtime post-launch hook for $name"
         else
@@ -434,7 +441,7 @@ cmd_start() {
         for ci in "${!CONFIRM_PANES[@]}"; do
             runtime_load "${CONFIRM_RUNTIMES[$ci]}" || return 1
             if runtime_has runtime::post_launch; then
-                if ! runtime::post_launch "${CONFIRM_PANES[$ci]}" "${CONFIRM_NAMES[$ci]}"; then
+                if ! runtime::post_launch "${CONFIRM_PANES[$ci]}" "${CONFIRM_NAMES[$ci]}" "${CONFIRM_UPGRADE[$ci]}"; then
                     log_err "runtime startup failed for '${CONFIRM_NAMES[$ci]}' — no successful launch confirmed"
                     return 1
                 fi
@@ -640,6 +647,8 @@ cmd_restart() {
         log_info "restart: starting…"
         local fwd=(start)
         if [ "$LAYOUT" = "window" ]; then fwd+=(--window); else fwd+=(--pane); fi
+        [ "$SKIP_DAEMON" = 1 ] && fwd+=(--skip-daemon)
+        export KA_CODEX_UPGRADE_ON_RESTART=1
         exec bash "$0" "${fwd[@]}"
     fi
     build_entries          # resolve TARGET → actual channel (including an optional main alias)
@@ -666,6 +675,8 @@ cmd_restart() {
     local fwd=(start "$TARGET")
     if [ "$LAYOUT" = "window" ]; then fwd+=(--window); else fwd+=(--pane); fi
     [ "$DRY_RUN" = "1" ] && fwd+=(--dry-run)
+    [ "$SKIP_DAEMON" = 1 ] && fwd+=(--skip-daemon)
+    export KA_CODEX_UPGRADE_ON_RESTART=1
     exec bash "$0" "${fwd[@]}"
 }
 

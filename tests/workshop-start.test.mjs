@@ -13,16 +13,32 @@ function fixture(scenario, runtime = 'codex') {
   const home = join(root, 'home')
   const bin = join(root, 'bin')
   mkdirSync(bin)
+  const succeeds = ['ready', 'delayed', 'existing-ready', 'legacy-endpoint', 'delayed-endpoint', 'sibling-window'].includes(scenario)
   const env = {
     ...process.env, KA_HOME: home, KA_STATE_DIR: join(home, 'state'), KA_CONFIG_DIR: join(home, 'config'),
     OPS_CONFIG: join(home, 'config/workshop.yaml'), KA_CONFIG: join(home, 'config/config.yaml'),
-    TMUX: '', NO_COLOR: '1', KA_WORKSHOP_START_TIMEOUT: '3', TEST_ROOT: root, TEST_SCENARIO: scenario,
+    // Every fake tmux call starts Python. On a busy CI host, allow happy paths
+    // to observe the second stability poll; negative timeouts stay short.
+    TMUX: '', NO_COLOR: '1', KA_WORKSHOP_START_TIMEOUT: succeeds ? '8' : '3', TEST_ROOT: root, TEST_SCENARIO: scenario,
     TMUX_BIN: join(bin, 'tmux'),
+    KA_CODEX_READY_PROBE: join(bin, 'probe.mjs'),
+    PATH: bin + ':' + process.env.PATH,
+    KA_GATE_TIMEOUT: '1', KA_CHANNEL_PORT: '1', KA_CHANNEL_KIND: 'telegram',
   }
   const installed = spawnSync('/bin/bash', [join(repo, 'install.sh'), '--only', 'ka'], { env, encoding: 'utf8', timeout: 15000 })
   assert.equal(installed.status, 0, installed.stdout + installed.stderr)
   writeFileSync(env.OPS_CONFIG, `session: isolated\nruntime: ${runtime}\nmates:\n  - name: test-mate\n    cwd: ${root}\n`)
   writeFileSync(env.KA_CONFIG, 'channel_kind: telegram\nchannels:\n  telegram:\n    port: 1\n')
+  writeFileSync(join(bin, 'codex'), '#!/bin/sh\necho "codex-cli 0.0.0-synthetic"\n', { mode: 0o755 })
+  writeFileSync(env.KA_CODEX_READY_PROBE, `import {appendFileSync} from 'node:fs';
+appendFileSync(process.env.TEST_ROOT+'/probes',JSON.stringify(process.argv.slice(2))+'\\n');
+const failed=['dead-server','silent-server','wrong-server-version','initialize-error'].includes(process.env.TEST_SCENARIO);
+console.log(JSON.stringify({ok:!failed,reason:failed?'synthetic_probe_failure':undefined}));process.exitCode=failed?1:0;
+`)
+  if (scenario === 'legacy-endpoint') {
+    mkdirSync(join(home, 'state/codex-app-servers'), { recursive: true })
+    writeFileSync(join(home, 'state/codex-app-servers/test-mate.log'), 'listening on: ws://127.0.0.1:1\n')
+  }
   writeFileSync(env.TMUX_BIN, `#!/usr/bin/env python3
 import os,sys,json
 from pathlib import Path
@@ -52,6 +68,10 @@ elif cmd=='display-message':
   p=root/'polls'; count=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(count))
   print('1' if scenario in ['dead','existing-dead'] or (scenario=='ready-then-exit' and count>1) else '0')
 elif cmd=='show-options':
+ if args[-1]=='@ka_codex_app_server_endpoint' and scenario not in ['legacy-endpoint','no-server-metadata']:
+  p=root/'endpoint-polls';count=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(count))
+  if scenario!='delayed-endpoint' or count>1: print('ws://127.0.0.1:1')
+ elif args[-1]=='@ka_channel': print('test-mate')
  if args[-1]=='@ka_codex_tui_state':
   if scenario=='fallback-shell': print('exited')
   elif scenario=='starting-with-prompt': print('starting')
@@ -59,12 +79,17 @@ elif cmd=='capture-pane':
  p=root/'captures';count=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(count))
  ready=scenario not in ['timeout','existing-timeout'] and (scenario!='delayed' or count>1)
  if scenario=='update-dialog': print('? for shortcuts\\n  Update available · synthetic-old → synthetic-new\\nenter continue · esc skip')
+ elif scenario=='hook-review-dialog': print('Hooks need review\\n  ›  \\n? for shortcuts')
+ elif scenario=='hook-trust-dialog': print('2. Trust all and continue\\n100% context left')
+ elif scenario=='hook-skip-dialog': print('3. Continue without trusting\\nAsk Codex')
  elif scenario=='legacy-fallback-shell': print('? for shortcuts\\n[start-pane:test-mate] Codex TUI exited with status 1')
  else: print('? for shortcuts' if ready else 'Starting Codex...')
 `, { mode: 0o755 })
   if (scenario.startsWith('existing-') || ['split-error', 'sibling-window'].includes(scenario)) writeFileSync(join(root, 'created'), '')
   const invoke = (...args) => {
-    const r = spawnSync('/bin/bash', [join(home, 'shared/bin/ka'), 'workshop', ...args], { env, encoding: 'utf8', timeout: 15000 })
+    // The CLI's own readiness budget remains bounded. Allow extra parent watchdog
+    // time for installer/CLI setup under the parallel reliability suite.
+    const r = spawnSync('/bin/bash', [join(home, 'shared/bin/ka'), 'workshop', ...args], { env, encoding: 'utf8', timeout: 30000 })
     assert.equal(r.error, undefined, String(r.error))
     return { ...r, output: r.stdout + r.stderr }
   }
@@ -72,7 +97,7 @@ elif cmd=='capture-pane':
   return { root, home, env, invoke, journal, close: () => rmSync(root, { recursive: true, force: true }) }
 }
 
-for (const scenario of ['ready', 'delayed', 'existing-ready']) {
+for (const scenario of ['ready', 'delayed', 'existing-ready', 'legacy-endpoint', 'delayed-endpoint']) {
   for (const layout of ['--pane', '--window']) {
     test(`workshop start confirms ${scenario} Codex runtime (${layout}) without KB or Channel`, () => {
       const f = fixture(scenario)
@@ -82,14 +107,16 @@ for (const scenario of ['ready', 'delayed', 'existing-ready']) {
         assert.match(r.output, /ready \(/)
         assert.match(r.output, scenario === 'existing-ready' ? /already running in session/ : /start: launched/)
         assert.ok(f.journal().some(a => a[0] === 'capture-pane'))
+        assert.ok(readFileSync(join(f.root, 'probes'), 'utf8').includes('0.0.0-synthetic'))
         if (scenario === 'existing-ready') assert.equal(f.journal().some(a => ['new-session', 'split-window', 'new-window'].includes(a[0])), false)
         if (scenario === 'delayed') assert.ok(Number(readFileSync(join(f.root, 'captures'), 'utf8')) > 1)
+        if (scenario === 'delayed-endpoint') assert.ok(Number(readFileSync(join(f.root, 'endpoint-polls'), 'utf8')) > 1)
       } finally { f.close() }
     })
   }
 }
 
-for (const scenario of ['dead', 'vanished', 'no-pane', 'creation-error', 'split-error', 'timeout', 'ready-then-exit', 'existing-dead', 'existing-timeout', 'fallback-shell', 'legacy-fallback-shell', 'update-dialog', 'starting-with-prompt']) {
+for (const scenario of ['dead', 'vanished', 'no-pane', 'creation-error', 'split-error', 'timeout', 'ready-then-exit', 'existing-dead', 'existing-timeout', 'fallback-shell', 'legacy-fallback-shell', 'update-dialog', 'hook-review-dialog', 'hook-trust-dialog', 'hook-skip-dialog', 'starting-with-prompt', 'dead-server', 'silent-server', 'wrong-server-version', 'initialize-error', 'no-server-metadata']) {
   test(`workshop start rejects ${scenario}; no successful launch is reported`, () => {
     const f = fixture(scenario)
     try {
@@ -99,6 +126,7 @@ for (const scenario of ['dead', 'vanished', 'no-pane', 'creation-error', 'split-
       if (scenario.includes('timeout')) assert.match(r.output, /timeout.*never reached ready state/)
       if (scenario === 'dead' || scenario === 'existing-dead' || scenario === 'ready-then-exit') assert.match(r.output, /exited before runtime readiness/)
       if (scenario === 'no-pane') assert.match(r.output, /failed to create runtime pane/)
+      if (scenario.startsWith('hook-')) assert.match(r.output, /Codex hook review is required/)
     } finally { f.close() }
   })
 }
@@ -135,6 +163,17 @@ test('a stopped Channel is a warning, not a Codex startup dependency', () => {
   } finally { f.close() }
 })
 
+test('Claude startup never invokes Codex version or protocol checks', () => {
+  const f = fixture('ready', 'cc')
+  try {
+    writeFileSync(join(f.root, 'bin/codex'), '#!/bin/sh\nexit 77\n', { mode: 0o755 })
+    const r = f.invoke('start', 'test-mate', '--skip-daemon')
+    assert.equal(r.status, 0, r.output)
+    assert.match(r.output, /start: launched/)
+    assert.throws(() => readFileSync(join(f.root, 'probes')))
+  } finally { f.close() }
+})
+
 test('readiness timeout rejects invalid values before polling', () => {
   const f = fixture('ready')
   try {
@@ -156,7 +195,9 @@ test('runtime dispatch clears the Codex post-launch hook when changing adapters'
   try {
     const r = spawnSync('/bin/bash', ['-c', 'source "$KA_HOME/shared/ops/common.sh"; source "$KA_RUNTIMES_DIR/dispatch.sh"; runtime_load codex; declare -f runtime::post_launch; runtime_load cc; declare -f runtime::post_launch'], { env: f.env, encoding: 'utf8' })
     assert.equal(r.status, 0, r.stderr)
-    assert.equal((r.stdout.match(/wait-ready.sh/g) || []).length, 1)
+    // Initial readiness and the one permitted post-upgrade recheck both belong
+    // to Codex; neither must leak into the subsequently loaded Claude adapter.
+    assert.equal((r.stdout.match(/wait-ready.sh/g) || []).length, 2)
     assert.match(r.stdout, /dev-channels gate/)
   } finally { f.close() }
 })
