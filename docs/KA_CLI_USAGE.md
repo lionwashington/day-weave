@@ -132,6 +132,33 @@ timeout is 60 seconds; override it with `KA_WORKSHOP_START_TIMEOUT=<seconds>`.
 `--dry-run` does not wait. Neither KB nor an online Channel daemon is required
 for the Codex TUI to start.
 
+Start/restart also checks the local App Server protocol and version. Installation
+failures, a non-listening child, fallback shells and failed RPC probes return
+nonzero. Ordinary `start` checks never confirm upgrade dialogs or restart an
+existing pane. During an explicit `workshop restart`, a newly launched Codex
+pane's recognized update menu selects **Update now** once (moving from a known
+Skip option if needed, then checking the highlighted choice before Enter).
+It waits for installer success and a verified newer executable,
+then stops the verified mate process group and respawns the same pane with its
+original command/cwd/arguments. Both TUI and App Server must pass readiness on
+the new version. An installer error/timeout, unrecognized menu, unchanged
+version, or repeated update prompt fails without a retry loop. Installer timeout
+defaults to 300 seconds (`KA_CODEX_UPGRADE_TIMEOUT`); it never kills an unfinished
+installer. No installation command is taken from pane text, no other running
+mates are restarted, and Claude does not use this flow. Model authentication and
+external-network availability require an actual turn; they are not established
+by this startup check.
+
+A passive release-notice banner is not an upgrade confirmation dialog: it does
+not trigger keystrokes or block an otherwise usable composer.
+After an upgrade timeout, inspect the installer before repeating `restart`;
+an explicit restart stops that mate's process group, including its installer.
+
+Hook-review modals cannot count as ready. The launcher's existing one-off hook
+bypass is applied through exact invocation-local hook hashes, without changing
+persisted trust or enabling disabled hooks. A bounded startup discovery process
+exits before the real sidecar starts; no new resident supervisor is introduced.
+
 ### Examples
 
 ```bash

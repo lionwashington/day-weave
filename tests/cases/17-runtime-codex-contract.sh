@@ -66,7 +66,15 @@ export KA_CHANNEL_PORT=1
 cat > "$tmp_root/bin/codex" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "$FAKE_CODEX_CALLS"
+if [ -n "${FAKE_CODEX_BINARIES:-}" ]; then printf '%s\n' "$0" >> "$FAKE_CODEX_BINARIES"; fi
+if [ "$*" = '--version' ]; then echo 'codex-cli 0.0.0-synthetic'; exit 0; fi
+if printf '%s\n' "$*" | grep -q 'app-server --stdio'; then
+    if [ "${FAKE_HOOK_DISCOVERY_FAILURE:-0}" = 1 ]; then exit 77; fi
+    exec node -e 'require("readline").createInterface({input:process.stdin}).on("line",line=>{const r=JSON.parse(line);if(r.id)console.log(JSON.stringify({id:r.id,result:r.method==="initialize"?{}:{data:[{cwd:process.cwd(),hooks:[],errors:[]}]}}))})'
+fi
 if printf '%s\n' "$*" | grep -q 'app-server --listen'; then
+    if [ -n "${FAKE_CODEX_SWITCH_LINK:-}" ]; then ln -sf "$FAKE_CODEX_SWITCH_RELEASE" "$FAKE_CODEX_SWITCH_LINK"; fi
+    if [ "${FAKE_SERVER_NO_LISTEN:-0}" = 1 ]; then exec sleep 300; fi
     for endpoint in "$@"; do :; done
     port="${endpoint##*:}"
     exec python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(); time.sleep(30)' "$port"
@@ -127,6 +135,49 @@ FAKE_CODEX_CALLS="$tmp_root/calls" FAKE_FALLBACK_SHELL_MARKER="$tmp_root/fallbac
     || fail "fallback shell launch failed"
 [ -f "$tmp_root/fallback-opened" ] || fail "TUI exit killed the App Server instead of retaining the pane"
 ok "Codex App Server survives TUI exit until the pane owner exits"
+
+# The installed symlink changes during startup. A second PATH lookup would run
+# the broken new release for the TUI after starting the old App Server.
+mkdir -p "$tmp_root/pin-bin"
+cp "$tmp_root/bin/codex" "$tmp_root/pin-bin/release-one"
+printf '#!/bin/sh\nexit 88\n' > "$tmp_root/pin-bin/release-two"
+chmod +x "$tmp_root/pin-bin/release-two"
+ln -s "$tmp_root/pin-bin/release-one" "$tmp_root/pin-bin/codex"
+FAKE_CODEX_CALLS="$tmp_root/pin-calls" FAKE_CODEX_BINARIES="$tmp_root/pin-binaries" \
+    FAKE_CODEX_SWITCH_LINK="$tmp_root/pin-bin/codex" FAKE_CODEX_SWITCH_RELEASE="$tmp_root/pin-bin/release-two" \
+    PATH="$tmp_root/pin-bin:$PATH" KA_HOME="$REPO" \
+    "$OPS/start-pane.sh" codex pinned "$tmp_root/work" >/dev/null 2>&1 \
+    || fail "upgrade symlink race mixed releases or broke the TUI"
+[ "$(sort -u "$tmp_root/pin-binaries")" = "$tmp_root/pin-bin/release-one" ] || fail "App Server and TUI used different release paths"
+ok "actual wrapper pins one executable across an installer symlink switch"
+
+FAKE_CODEX_CALLS="$tmp_root/broken-calls" PATH="$tmp_root/pin-bin:$PATH" KA_HOME="$REPO" \
+    "$OPS/start-pane.sh" codex broken "$tmp_root/work" >/dev/null 2>&1 && fail "broken executable passed startup"
+if [ -f "$tmp_root/broken-calls" ]; then fail "broken executable launched runtime processes"; fi
+ok "broken installation fails preflight without starting sidecars"
+
+mkdir -p "$tmp_root/invalid-bin"
+printf '#!/bin/sh\necho synthetic-private-invalid-version\n' > "$tmp_root/invalid-bin/codex"
+chmod +x "$tmp_root/invalid-bin/codex"
+PATH="$tmp_root/invalid-bin:$PATH" KA_HOME="$REPO" \
+    "$OPS/start-pane.sh" codex invalid-version "$tmp_root/work" >"$tmp_root/invalid-version-output" 2>&1 \
+    && fail "invalid version output passed startup"
+grep -q 'returned an invalid version' "$tmp_root/invalid-version-output" || fail "invalid version output was not diagnosed"
+grep -q 'synthetic-private' "$tmp_root/invalid-version-output" && fail "untrusted version output leaked"
+ok "unexpected installation output is rejected without leaking its contents"
+
+FAKE_CODEX_CALLS="$tmp_root/hook-failure-calls" FAKE_HOOK_DISCOVERY_FAILURE=1 PATH="$tmp_root/bin:$PATH" KA_HOME="$REPO" \
+    "$OPS/start-pane.sh" codex hook-failure "$tmp_root/work" >"$tmp_root/hook-failure-output" 2>&1 \
+    && fail "failed hook discovery passed startup"
+grep -q 'cannot resolve invocation-local hook trust' "$tmp_root/hook-failure-output" || fail "hook discovery failure lacked a diagnosis"
+grep -q -- 'app-server --listen\|--remote' "$tmp_root/hook-failure-calls" && fail "hook failure launched runtime processes"
+ok "hook discovery failure stops before the real sidecar and TUI"
+
+FAKE_CODEX_CALLS="$tmp_root/no-listen-calls" FAKE_SERVER_NO_LISTEN=1 PATH="$tmp_root/bin:$PATH" KA_HOME="$REPO" \
+    "$OPS/start-pane.sh" codex no-listen "$tmp_root/work" >"$tmp_root/no-listen-output" 2>&1 \
+    && fail "live but non-listening App Server passed startup"
+grep -q 'App Server did not open its listener' "$tmp_root/no-listen-output" || fail "non-listening server was not diagnosed"
+ok "live process without a listening port stops before thread selection"
 
 : > "$tmp_root/calls"
 FAKE_CODEX_CALLS="$tmp_root/calls" PATH="$tmp_root/bin:$PATH" KA_HOME="$REPO" \
