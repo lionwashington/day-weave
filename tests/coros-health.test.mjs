@@ -14,6 +14,7 @@ import {
   argumentsForTool, normalizeObservations, rebuildWellness, selectWellnessTools,
   syncWellness, validateWellness, wellnessPaths, wellnessTrend,
   wellnessReport, WELLNESS_ALGORITHM_VERSION,
+  officialFailure,
 } from '../kb/skills/coros-health/scripts/coros-wellness.mjs';
 
 function makeFit({ start = '2026-01-20T00:00:00Z', device = 'PACE 4', finish = 330 } = {}) {
@@ -342,6 +343,83 @@ test('refreshes catalog and retains successful sleep when another capability fai
   }finally{rmSync(root,{recursive:true,force:true});}
 });
 
+test('transient wellness failures retry independently and preserve successful evidence', async t => {
+  const root=mkdtempSync(join(tmpdir(),'coros-retry-'));
+  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const counts={}; const delays=[];
+  const provider={listTools:()=>[{name:'querySleepOverview'},{name:'querySleepHrv'}], callTool:name=>{
+    counts[name]=(counts[name]||0)+1;
+    if(counts[name]===1) {
+      if(name==='querySleepOverview') return {isError:true,content:[{type:'text',text:'503 temporarily unavailable Bearer synthetic-private'}]};
+      throw Error('ETIMEDOUT synthetic-private');
+    }
+    return '2032-02-03\n'+(name==='querySleepOverview'?'Main Sleep (asleep): 7h 0min':'HRV Avg: 53 ms');
+  }};
+  const options={provider,startDate:'2032-02-03',endDate:'2032-02-03',retrySleep:ms=>delays.push(ms)};
+  const result=await syncWellness({root},options);
+  assert.deepEqual(result.tools_failed,[]);
+  assert.deepEqual(result.tool_attempts,{querySleepHrv:2,querySleepOverview:2});
+  assert.deepEqual(delays,[1000,1000]);
+  const trend=wellnessTrend({root},{date:'2032-02-03'});
+  assert.equal(trend.latest.sleep_minutes,420);assert.equal(trend.latest.hrv_ms,53);
+  for(const path of Object.values(wellnessPaths({root})).filter(path=>path.endsWith('.json')||path.endsWith('.jsonl'))) {
+    if (path.endsWith('observation-history.jsonl')) continue;
+    assert.doesNotMatch(readFileSync(path,'utf8'),/synthetic-private|Bearer/);
+  }
+  const again=await syncWellness({root},options);
+  assert.equal(again.observations_new,0);assert.equal(again.daily_changed,false);
+});
+
+test('bounded retries expose safe errors, retain cache and never fabricate missing-day readiness', async t => {
+  const root=mkdtempSync(join(tmpdir(),'coros-bounded-'));
+  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const provider={listTools:()=>[{name:'querySleepOverview'},{name:'querySleepHrv'},{name:'queryRestingHeartRate'}],
+    callTool:name=>'2032-02-03\n'+({querySleepOverview:'Main Sleep (asleep): 7h 0min',querySleepHrv:'HRV Avg: 53 ms',queryRestingHeartRate:'50 bpm'}[name])};
+  const paths={root}; const options={provider,startDate:'2032-02-03',endDate:'2032-02-03',retrySleep:()=>{}};
+  await syncWellness(paths,options);
+  provider.callTool=name=>{
+    if(name==='querySleepOverview') throw Error('network unavailable password=synthetic-private');
+    if(name==='querySleepHrv') return {isError:true,content:[{text:'401 unauthorized access_token=synthetic-private'}]};
+    return '2032-02-04: 50 bpm';
+  };
+  const result=await syncWellness(paths,{...options,endDate:'2032-02-04'});
+  assert.equal(result.remote.status,'partial');
+  assert.equal(result.tool_attempts.querySleepOverview,3);
+  assert.equal(result.tool_attempts.querySleepHrv,1);
+  assert.equal(result.tool_attempts.queryRestingHeartRate,1);
+  assert.deepEqual(result.tool_errors.querySleepHrv,{code:'authorization',retryable:false});
+  assert.deepEqual(result.tool_errors.querySleepOverview,{code:'transport',retryable:true});
+  assert.doesNotMatch(JSON.stringify(result),/synthetic-private|password=|access_token=/);
+  const trend=wellnessTrend(paths,{date:'2032-02-04'});
+  assert.equal(trend.report.ready,false);
+  assert.equal(trend.report.metrics.sleep_minutes,null);
+  assert.equal(trend.report.metric_data_through.sleep_minutes,'2032-02-03');
+  assert.deepEqual(trend.tool_errors,result.tool_errors);
+  assert.ok(readFileSync(wellnessPaths(paths).raw,'utf8').includes('Main Sleep'));
+});
+
+test('invalid requests stop immediately; failure classification never returns provider content', () => {
+  for(const message of ['-32602 invalid params synthetic-private','Unknown tool: invalid_tool_name synthetic-private'])
+    assert.deepEqual(officialFailure(Error(message)),{code:'invalid_request',retryable:false});
+  assert.deepEqual(officialFailure(Error('429 too many requests')),{code:'rate_limit',retryable:true});
+  assert.deepEqual(officialFailure(Error('secret unknown')),{code:'tool_error',retryable:true});
+});
+
+test('incremental sync recovers the oldest metric gap even after aggregate dates advance', async t => {
+  const root=mkdtempSync(join(tmpdir(),'coros-gap-'));
+  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const wp=wellnessPaths({root}); mkdirSync(join(wp.root,'derived'),{recursive:true});
+  mkdirSync(join(wp.root,'state'),{recursive:true});
+  writeFileSync(wp.state,JSON.stringify({data_through:'2032-02-12'}));
+  writeFileSync(wp.daily,[{date:'2032-02-03',sleep_minutes:420,hrv_ms:53},
+    {date:'2032-02-12',resting_hr_bpm:50,stress:20,recovery:90}].map(x=>JSON.stringify(x)).join('\n')+'\n');
+  const provider={listTools:()=>[{name:'querySleepOverview'}],callTool:()=> '2032-02-12\nMain Sleep (asleep): 7h 0min'};
+  const result=await syncWellness({root},{provider,endDate:'2032-02-12'});
+  assert.equal(result.start_date,'2032-02-01');
+  const explicit=await syncWellness({root},{provider,startDate:'2032-02-10',endDate:'2032-02-12'});
+  assert.equal(explicit.start_date,'2032-02-10');
+});
+
 test('wellness sync is incremental, idempotent and strips OAuth secrets', async () => {
   const root = mkdtempSync(join(tmpdir(), 'coros-wellness-'));
   const paths = fixture(root, [{ labelId: 'run-1', date: 20260120, name: 'Run', sportType: 100, trainingLoad: 60 }]);
@@ -420,5 +498,44 @@ test('emits JSON when invoked through Codex and Claude discovery symlinks', () =
     ], { encoding: 'utf8' });
     assert.equal(trend.status, 0, trend.stderr);
     assert.equal(JSON.parse(trend.stdout).source, 'local_cache');
+  }
+});
+
+test('CLI end-to-end retries an MCP isError response through both discovery roots', t => {
+  const root=mkdtempSync(join(tmpdir(),'coros-cli-retry-'));
+  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const helper=join(root,'official-helper.mjs');
+  writeFileSync(helper,`#!/usr/bin/env node
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const argv=process.argv; const names=['querySleepHrv','querySleepOverview','queryRestingHeartRate','queryStressLevel','queryRecoveryStatus'];
+if(argv.includes('list-tools')) console.log(JSON.stringify(names.map(name=>({name,inputSchema:{properties:{startDate:{},endDate:{}}}}))));
+else {
+  const name=argv[argv.indexOf('--tool')+1];
+  const marker=join(process.env.MCP_CACHE_ROOT,'retry-marker');
+  if(name==='querySleepHrv'&&!existsSync(marker)) {
+    writeFileSync(marker,'1');
+    console.log(JSON.stringify({isError:true,content:[{type:'text',text:'503 temporarily unavailable Bearer synthetic-private'}]}));
+  } else {
+    const metric={querySleepHrv:'HRV Avg: 53 ms',querySleepOverview:'Main Sleep (asleep): 7h 0min',queryRestingHeartRate:'Resting Heart Rate: 50 bpm',queryStressLevel:'Stress: 20',queryRecoveryStatus:'Recovery: 90%'}[name];
+    const text=name==='queryRestingHeartRate'?'2032-02-03: 50 bpm':'2032-02-03\\n'+metric;
+    console.log(JSON.stringify({isError:false,content:[{type:'text',text}]}));
+  }
+}
+`,{mode:0o700});
+  for(const discovery of ['.codex','.claude']) {
+    const workspace=join(root,discovery);mkdirSync(join(workspace,'skills'),{recursive:true});
+    const link=join(workspace,'skills','coros-health');
+    symlinkSync(join(import.meta.dirname,'..','kb','skills','coros-health'),link,'dir');
+    const data=join(workspace,'data');const cache=join(workspace,'private-oauth');
+    const args=[join(link,'scripts','coros-health.mjs'),'wellness-sync','--workspace',workspace,'--data-root',data,'--from','2032-02-03','--to','2032-02-03'];
+    const env={...process.env,COROS_MCP_CLI:helper,COROS_MCP_CACHE_ROOT:cache};
+    const run=()=>{const r=spawnSync(process.execPath,args,{encoding:'utf8',env});assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout);};
+    const result=run();assert.equal(result.remote.status,'ok');assert.equal(result.tool_attempts.querySleepHrv,2);
+    assert.deepEqual(result.tools_failed,[]);assert.doesNotMatch(JSON.stringify(result),/synthetic-private/);
+    assert.equal(wellnessTrend({root:data},{date:'2032-02-03'}).report.ready,true);
+    const raw=readFileSync(wellnessPaths({root:data}).raw,'utf8');assert.doesNotMatch(raw,/synthetic-private/);
+    const again=run();assert.equal(again.observations_new,0);assert.equal(again.daily_changed,false);
+    assert.equal(again.tool_attempts.querySleepHrv,1);assert.equal(readFileSync(wellnessPaths({root:data}).raw,'utf8'),raw);
   }
 });

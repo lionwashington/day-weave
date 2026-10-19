@@ -75,6 +75,15 @@ Sync reports `partial` when current responses lack requested-day key metrics,
 with `missing_latest_metrics` and independent `metric_data_through` watermarks.
 Aggregate `data_through` alone does not prove today's sleep/HRV has synced.
 
+Incremental requests overlap the oldest available per-metric cached watermark
+by two days, rather than trusting the newest aggregate date. Explicit `--from`
+still overrides that choice. `tool_attempts` and `tool_errors` are persisted in
+wellness sync state and exposed by trend. Errors contain only a category code
+and retryability; raw error text is never stored. Each failing read gets at most
+three attempts (1s then 2s delay); authorization and invalid requests are not
+retried. A successful retry does not replay other successful tools. Exhausted
+failures leave prior observations intact and remain visible as partial/failed.
+
 Prefer FIT session/lap values, then fill absent overview values from COROS metadata. Persist distance, timer and elapsed time, pace, heart rate, cadence, power, temperature, ascent, calories, training load, device and sport fields when available.
 
 FIT running cadence commonly represents one-foot strides per minute. Values below 130 are normalized to total steps per minute by multiplying by two; derived cadence columns always use `spm`.

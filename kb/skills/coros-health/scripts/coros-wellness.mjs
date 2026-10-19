@@ -55,6 +55,35 @@ function compactError(error) {
     .slice(0, 500);
 }
 
+// Classify in memory; never persist provider messages (which can contain tokens
+// or health records). Only transient/unknown failures get bounded read retries.
+export function officialFailure(error) {
+  const text = typeof error === 'string' ? error : JSON.stringify(error?.message || error || '');
+  if (/invalid_grant|invalid_client|unauthori[sz]ed|forbidden|no local token|\b(?:401|403)\b/i.test(text)) return { code: 'authorization', retryable: false };
+  if (/invalid_tool_name|unknown tool|tool not found|invalid.params|invalid.arguments|\b-32602\b/i.test(text)) return { code: 'invalid_request', retryable: false };
+  if (/rate.limit|too many requests|\b429\b/i.test(text)) return { code: 'rate_limit', retryable: true };
+  if (/timed?\s*out|timeout|ETIMEDOUT|AbortError/i.test(text)) return { code: 'timeout', retryable: true };
+  if (/network|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|socket/i.test(text)) return { code: 'transport', retryable: true };
+  if (/\b50[0234]\b|server.error|temporarily.unavailable/i.test(text)) return { code: 'server', retryable: true };
+  return { code: 'tool_error', retryable: true };
+}
+
+async function callWellnessTool(provider, tool, args, options) {
+  const attemptsLimit = 3;
+  const sleep = options.retrySleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  for (let attempt = 1; attempt <= attemptsLimit; attempt++) {
+    try {
+      const response = await provider.callTool(tool.name, args);
+      if (response?.isError) throw Object.assign(new Error('official tool returned an error'), { failure: officialFailure(response) });
+      return { response, attempts: attempt };
+    } catch (error) {
+      const failure = error?.failure || officialFailure(error);
+      if (!failure.retryable || attempt === attemptsLimit) return { failure, attempts: attempt };
+      await sleep(attempt * 1000);
+    }
+  }
+}
+
 export function wellnessPaths(paths) {
   const root = join(paths.root, 'wellness');
   return {
@@ -128,7 +157,7 @@ export function createOfficialProvider(options = {}) {
     },
     callTool(name, args) {
       const result = parseHelperJson(runOfficialHelper('call-tool', ['--tool', name, '--arguments-json', JSON.stringify(args)], options));
-      if (result?.isError) throw new Error(`official tool ${name} failed`);
+      if (result?.isError) throw Object.assign(new Error(`official tool ${name} failed`), { failure: officialFailure(result) });
       return result;
     },
   };
@@ -464,7 +493,13 @@ export async function syncWellness(paths, options = {}) {
   mkdirSync(join(wp.root, 'raw'), { recursive: true, mode: 0o700 });
   const previous = readJson(wp.state, {});
   const today = options.endDate || localToday(options.now, options.timeZone);
-  const start = options.startDate || (previous.data_through ? shiftDate(previous.data_through, -2) : shiftDate(today, -27));
+  const expected = ['hrv_ms', 'sleep_minutes', 'resting_hr_bpm', 'stress', 'recovery'];
+  // An aggregate watermark may advance even while a dedicated tool is down.
+  // Recover from the oldest actual metric watermark, retaining the late-data overlap.
+  const cached = readJsonl(wp.daily);
+  const watermarks = expected.map(field => cached.filter(row => row.date <= today && Number.isFinite(row[field])).at(-1)?.date).filter(Boolean);
+  if (previous.data_through && previous.data_through <= today) watermarks.push(previous.data_through);
+  const start = options.startDate || (watermarks.length ? shiftDate(watermarks.sort()[0], -2) : shiftDate(today, -27));
   const provider = options.provider || createOfficialProvider(options);
   const result = { remote: { status: 'not_attempted', error: null }, start_date: start, end_date: today, tools_called: [], missing_categories: [], observations_new: 0, daily_changed: false, data_through: previous.data_through || null };
   try {
@@ -478,19 +513,19 @@ export async function syncWellness(paths, options = {}) {
     const existing = readJsonl(wp.raw);
     const incoming = [];
     result.tools_failed = [];
+    result.tool_attempts = {};
+    result.tool_errors = {};
     for (const { kind, tool } of selected) {
       const args = argumentsForTool(tool, start, today);
       result.tools_called.push(tool.name);
-      let payload;
-      try {
-        const response = await provider.callTool(tool.name, args);
-        if (response?.isError) throw new Error('tool returned an error');
-        payload = scrub(response);
-      } catch {
-        // Report capability, not provider text which may contain credentials.
+      const call = await callWellnessTool(provider, tool, args, options);
+      result.tool_attempts[tool.name] = call.attempts;
+      if (call.failure) {
         result.tools_failed.push(tool.name);
+        result.tool_errors[tool.name] = call.failure;
         continue;
       }
+      const payload = scrub(call.response);
       incoming.push({ key: `${tool.name}:${start}:${today}`, schema_version: WELLNESS_SCHEMA_VERSION, fetched_at: new Date().toISOString(), range: { start_date: start, end_date: today }, kind, tool: tool.name, payload });
     }
     const merged = mergeByKey(existing, incoming, 'key');
@@ -513,7 +548,6 @@ export async function syncWellness(paths, options = {}) {
     result.daily_changed = before !== after;
     result.data_through = rebuilt.data_through;
     const current = normalizeObservations(incoming);
-    const expected = ['hrv_ms', 'sleep_minutes', 'resting_hr_bpm', 'stress', 'recovery'];
     result.metric_data_through = Object.fromEntries(expected.map(field => [field, current.filter(row => Number.isFinite(row[field])).at(-1)?.date || null]));
     result.missing_latest_metrics = expected.filter(field => result.metric_data_through[field] !== today);
     result.remote.status = !incoming.length ? 'failed'
@@ -536,6 +570,8 @@ export async function syncWellness(paths, options = {}) {
     missing_latest_metrics: result.missing_latest_metrics || previous.missing_latest_metrics || [],
     last_remote_status: result.remote.status,
     tools_failed: result.tools_failed || [],
+    tool_attempts: result.tool_attempts || {},
+    tool_errors: result.tool_errors || {},
     missing_categories: result.missing_categories,
   }));
   return result;
@@ -567,6 +603,8 @@ export function wellnessTrend(paths, { days = 28, date = localToday() } = {}) {
     missing_latest_metrics: state.missing_latest_metrics || [],
     last_remote_status: state.last_remote_status || null,
     tools_failed: state.tools_failed || [],
+    tool_attempts: state.tool_attempts || {},
+    tool_errors: state.tool_errors || {},
     missing_categories: state.missing_categories || [],
     report: wellnessReport(daily, date),
     trends: readJson(wp.trends, null),

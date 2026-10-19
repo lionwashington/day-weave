@@ -71,6 +71,12 @@ node scripts/coros-health.mjs migrate --legacy-dir /path/to/legacy/coros-data
 
 Both channels are incremental. Wellness sync overlaps the last two cached days because sleep and recovery records can settle late, then replaces matching observations idempotently. `sync --repair` checks every known activity for a missing or invalid FIT but does not redownload valid files. If either remote call fails, report its status/error and cached `data_through` while continuing to use local results. Do not request official MCP FIT files merely to answer wellness questions; COROS caps them at 50 per calendar day.
 
+Wellness increment starts from the oldest cached metric watermark, so a failed
+sleep/HRV source cannot be skipped as other metrics advance. Read-only transient
+tool failures get at most three attempts with 1s/2s delays; authorization and
+invalid-request errors stop immediately. `tool_attempts` shows actual attempts;
+`tool_errors` contains only safe error categories, never provider messages.
+
 For morning reports, check `missing_latest_metrics` and `metric_data_through`,
 not only the aggregate date or successful tool calls. Watch data may arrive late;
 never relabel yesterday's sleep/HRV as today's. `sleep_minutes` is dedicated Main
