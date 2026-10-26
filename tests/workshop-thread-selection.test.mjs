@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const selector = fileURLToPath(new URL('../workshop/ops/runtimes/codex/select-thread.mjs', import.meta.url))
-for (const scenario of ['latest', 'fresh', 'wait', 'explicit', 'explicit-missing', 'explicit-timeout', 'explicit-wrong-cwd', 'list-error', 'list-wrong-cwd', 'resume-error', 'resume-wrong-cwd', 'explicit-unloaded', 'explicit-unloaded-wrong-cwd', 'explicit-unloaded-resume-missing', 'explicit-unloaded-other-thread']) {
+for (const scenario of ['latest', 'fresh', 'wait', 'bound', 'bound-fresh', 'bound-wrong-cwd', 'explicit', 'explicit-missing', 'explicit-timeout', 'explicit-wrong-cwd', 'list-error', 'list-wrong-cwd', 'resume-error', 'resume-wrong-cwd', 'explicit-unloaded', 'explicit-unloaded-wrong-cwd', 'explicit-unloaded-resume-missing', 'explicit-unloaded-other-thread']) {
   test(`selector subprocess: ${scenario}`, () => {
     const root = mkdtempSync(join(tmpdir(), 'ka-thread-test-'))
     try {
@@ -15,6 +15,9 @@ for (const scenario of ['latest', 'fresh', 'wait', 'explicit', 'explicit-missing
       const journal = join(root, 'requests.jsonl')
       const shim = join(root, 'websocket.mjs')
       writeFileSync(owner, 'old-thread\n')
+      const binding = join(root, 'session.json')
+      if (scenario.startsWith('bound')) writeFileSync(binding, JSON.stringify({ schema_version: 1, cwd: scenario === 'bound-wrong-cwd' ? '/synthetic/other' : '/synthetic/work', threadId: 'own-thread', fresh: scenario === 'bound-fresh' }))
+      writeFileSync(journal, '')
       writeFileSync(shim, `
 import { appendFileSync } from 'node:fs';
 globalThis.WebSocket = class extends EventTarget {
@@ -37,7 +40,7 @@ globalThis.WebSocket = class extends EventTarget {
       (s === 'list-wrong-cwd' && req.method === 'thread/list') ||
       (['resume-wrong-cwd', 'explicit-unloaded-wrong-cwd'].includes(s) && req.method === 'thread/resume');
     const cwd = wrong ? '/synthetic/other-mate' : '/synthetic/work';
-    const result = req.method === 'thread/list' ? { data: s === 'fresh' ? [] : [{ id: 'latest-thread', cwd }] } :
+    const result = req.method === 'thread/loaded/list' ? { data: ['latest-thread'] } : req.method === 'thread/list' ? { data: s === 'fresh' ? [] : [{ id: 'latest-thread', cwd }] } :
       req.method.startsWith('thread/') ? { thread: { id: req.params.threadId, cwd } } : {};
     const response = error ? { error: { code: -32600, message: 'synthetic failure' } } : { result };
     queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ id: req.id, ...response }) })));
@@ -47,22 +50,22 @@ globalThis.WebSocket = class extends EventTarget {
       const explicit = scenario.startsWith('explicit')
       const result = spawnSync(process.execPath, ['--import', shim, selector, 'ws://synthetic', '/synthetic/work', explicit ? 'explicit-thread' : '', scenario === 'wait' ? 'wait' : 'select'], {
         encoding: 'utf8', timeout: 5000,
-        env: { ...process.env, KA_CODEX_THREAD_OWNER_FILE: owner, KA_CODEX_MODEL: 'synthetic-model', TEST_JOURNAL: journal, TEST_SCENARIO: scenario, KA_CODEX_THREAD_RESUME_TIMEOUT_MS: '100' },
+        env: { ...process.env, KA_CODEX_SESSION_FILE: binding, KA_CODEX_THREAD_OWNER_FILE: owner, KA_CODEX_MODEL: 'synthetic-model', TEST_JOURNAL: journal, TEST_SCENARIO: scenario, KA_CODEX_THREAD_RESUME_TIMEOUT_MS: '100' },
       })
-      const requests = readFileSync(journal, 'utf8').trim().split('\n').map(JSON.parse)
+      const requests = readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
       assert.equal(requests.some(r => r.params?.threadId === 'old-thread'), false)
       assert.equal(readFileSync(owner, 'utf8'), 'old-thread\n')
       if (/missing|timeout|wrong-cwd|error|other-thread/.test(scenario)) {
         assert.notEqual(result.status, 0)
         assert.equal(result.stdout, '')
-        assert.match(result.stderr, /another workspace|synthetic failure|timed out|thread not loaded: another-thread/)
+        assert.match(result.stderr, /another workspace|synthetic failure|timed out|thread not loaded: another-thread|invalid mate session binding/)
       } else {
         assert.equal(result.status, 0, result.stderr)
         const output = JSON.parse(result.stdout)
-        assert.equal(output.fresh, scenario === 'fresh')
-        assert.equal(output.id, scenario === 'fresh' ? '' : explicit ? 'explicit-thread' : 'latest-thread')
+        assert.equal(output.fresh, ['fresh', 'bound-fresh'].includes(scenario))
+        assert.equal(output.id, ['fresh', 'bound-fresh'].includes(scenario) ? '' : scenario === 'bound' ? 'own-thread' : explicit ? 'explicit-thread' : 'latest-thread')
       }
-      if (explicit) assert.equal(requests.some(r => r.method === 'thread/list'), false)
+      if (explicit || scenario.startsWith('bound') || scenario === 'wait') assert.equal(requests.some(r => r.method === 'thread/list'), false)
       else {
         assert.deepEqual(requests.find(r => r.method === 'thread/list').params,
           { cwd: '/synthetic/work', limit: 1, sortKey: 'recency_at', sortDirection: 'desc' })
@@ -70,7 +73,7 @@ globalThis.WebSocket = class extends EventTarget {
       }
       for (const r of requests.filter(r => r.method === 'thread/resume')) {
         assert.equal(r.params.model, 'synthetic-model')
-        assert.equal(r.params.threadId, explicit ? 'explicit-thread' : 'latest-thread')
+        assert.equal(r.params.threadId, scenario === 'bound' ? 'own-thread' : explicit ? 'explicit-thread' : 'latest-thread')
       }
       if (['fresh', 'wait', 'list-error', 'list-wrong-cwd', 'explicit-missing', 'explicit-timeout', 'explicit-wrong-cwd', 'explicit-unloaded-other-thread'].includes(scenario)) {
         assert.equal(requests.some(r => r.method === 'thread/resume'), false)

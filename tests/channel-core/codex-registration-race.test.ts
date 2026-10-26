@@ -29,6 +29,7 @@ async function fixture(t: any) {
   const dir = mkdtempSync(join(tmpdir(), 'ka-registration-race-'))
   const sockets = new Set<Socket>()
   const resumes: Array<{ finish: (fail?: boolean) => void }> = []
+  const threadStatus = { type: 'idle' }
   const socketPath = join(dir, 'rpc.sock')
   const rpc = createServer(socket => {
     sockets.add(socket)
@@ -37,6 +38,7 @@ async function fixture(t: any) {
       const message = JSON.parse(line)
       const send = (result: unknown) => socket.write(JSON.stringify({ id: message.id, result }) + '\n')
       if (message.method === 'initialize') send({ userAgent: 'synthetic' })
+      if (message.method === 'thread/read') send({ thread: { id: message.params.threadId, cwd: dir, status: threadStatus } })
       if (message.method === 'thread/resume') resumes.push({ finish: (fail = false) => {
         if (fail) socket.write(JSON.stringify({ id: message.id, error: { code: -32000, message: 'synthetic resume failure' } }) + '\n')
         else send({ thread: { id: message.params.threadId, cwd: dir, status: { type: 'idle' }, turns: [] }, model: 'synthetic' })
@@ -54,8 +56,48 @@ async function fixture(t: any) {
     rmSync(dir, { recursive: true, force: true })
   })
   const registration = { name: 'synthetic-mate', cwd: dir, socketPath, threadId: 'synthetic-thread' }
-  return { dir, manager, resumes, registration, sockets }
+  return { dir, manager, resumes, registration, sockets, threadStatus }
 }
+
+test('session switch holds routing across unregister/register, releases only to expected thread, and isolates siblings', async t => {
+  const { manager, registration, resumes, dir, threadStatus } = await fixture(t)
+  let registering = manager.register(registration)
+  await waitFor(() => resumes.length === 1); resumes[0].finish(); await registering
+  await assert.rejects(manager.sessionSwitch(registration.name, 'begin', undefined, '/wrong'), /workspace mismatch/)
+  threadStatus.type = 'active'
+  await assert.rejects(manager.sessionSwitch(registration.name, 'begin', undefined, dir), /not idle/)
+  assert.equal((await manager.sessionSwitch(registration.name, 'status') as any).held, false)
+  threadStatus.type = 'idle'
+  await manager.sessionSwitch(registration.name, 'begin', undefined, dir)
+  const held = runtimeTargetOf(registration.name)!
+  await held.deliver({ content: 'synthetic pending', meta: {} })
+  await manager.unregister(registration.name)
+  assert.equal(runtimeTargetOf(registration.name), held)
+  registering = manager.register({ ...registration, threadId: 'synthetic-new' })
+  await waitFor(() => resumes.length === 2); resumes[1].finish(); await registering
+  assert.equal(runtimeTargetOf(registration.name), held)
+  await assert.rejects(manager.sessionSwitch(registration.name, 'release', 'wrong'), /not ready/)
+  const delivered: string[] = []
+  const actual = (manager as any).targets.get(registration.name).target
+  actual.deliver = async (message: any) => { delivered.push(message.content) }
+  await manager.sessionSwitch(registration.name, 'release', 'synthetic-new')
+  await waitFor(() => runtimeTargetOf(registration.name) !== held)
+  assert.deepEqual(delivered, ['synthetic pending'])
+  assert.equal((await manager.sessionSwitch(registration.name, 'status') as any).held, false)
+})
+
+test('daemon restart restores a held first-session queue without selecting another mate', async t => {
+  const { manager, dir } = await fixture(t)
+  await manager.sessionSwitch('new-mate', 'begin-new', undefined, dir)
+  await runtimeTargetOf('new-mate')!.deliver({ content: 'synthetic retained', meta: {} })
+  await manager.stop()
+  const restored = new CodexRuntimeManager(platform, { platform: 'telegram', bindingsPath: join(dir, 'bindings.json'), externalChatId: 'synthetic' })
+  try {
+    assert.equal((await restored.sessionSwitch('new-mate', 'status') as any).held, true)
+    assert.ok(runtimeTargetOf('new-mate'))
+    await assert.rejects(restored.sessionSwitch('new-mate', 'begin-new', undefined, dir), /already held/)
+  } finally { await restored.stop() }
+})
 
 test('concurrent slow registration retries perform exactly one resume, including metadata changes', async t => {
   const { manager, registration, resumes, sockets } = await fixture(t)

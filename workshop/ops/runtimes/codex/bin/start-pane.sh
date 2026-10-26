@@ -256,6 +256,7 @@ fi
 
 THREAD_SELECTOR="${KA_CODEX_THREAD_SELECTOR:-$KA_RUNTIMES_DIR/codex/select-thread.mjs}"
 THREAD_OWNER_FILE="$SOCKET_DIR/$SAFE_NAME.thread"
+export KA_CODEX_SESSION_FILE="$SOCKET_DIR/$SAFE_NAME.session.json"
 # Output-only runtime record; selection defaults to the latest exact-cwd thread.
 THREAD_JSON="$(node "$THREAD_SELECTOR" "$APP_SERVER_ENDPOINT" "$EXPECTED_CWD" "$REQUESTED_THREAD_ID" select)" || {
     echo "[start-pane:$PANE_NAME] ERROR: cannot select canonical Codex thread"
@@ -269,6 +270,16 @@ persist_thread_owner() {
     printf '%s\n' "$thread_id" > "$owner_tmp"
     chmod 600 "$owner_tmp" 2>/dev/null || true
     mv "$owner_tmp" "$THREAD_OWNER_FILE"
+    if [ -f "$KA_CODEX_SESSION_FILE" ]; then
+        node --input-type=module - "$KA_CODEX_SESSION_FILE" "$EXPECTED_CWD" "$thread_id" "${2:-$FRESH_THREAD}" <<'NODE'
+import {readFileSync, writeFileSync, renameSync} from 'node:fs';
+const [file,cwd,threadId,unpersisted]=process.argv.slice(2);
+const old=JSON.parse(readFileSync(file,'utf8'));
+if(old.cwd!==cwd) throw new Error('mate binding workspace changed');
+writeFileSync(file+'.tmp',JSON.stringify({...old,threadId,fresh:false,unpersisted:unpersisted==='1'}),{mode:0o600});
+renameSync(file+'.tmp',file);
+NODE
+    fi
 }
 
 register_loop() {
@@ -292,6 +303,7 @@ register_loop() {
             if [ -n "$resolved_path" ]; then
                 [ "$resolved_path" = "resumable" ] || thread_path="$resolved_path"
                 allow_unpersisted=0
+                persist_thread_owner "$canonical_thread_id" 0
             fi
         fi
         body="$(PANE_NAME="$SAFE_NAME" PANE_CWD="$EXPECTED_CWD" APP_SERVER_ENDPOINT="$APP_SERVER_ENDPOINT" THREAD_ID="$canonical_thread_id" THREAD_PATH="$thread_path" ALLOW_UNPERSISTED_THREAD="$allow_unpersisted" node -e \

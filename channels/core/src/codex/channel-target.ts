@@ -88,6 +88,7 @@ export class CodexChannelTarget implements RuntimeTarget {
   private readonly options: CodexChannelTargetOptions
   private binding?: ChannelBinding
   private queue: Promise<void> = Promise.resolve()
+  private pendingDeliveries = 0
   private activeTurnId?: string
   private activeSource?: RuntimeTargetMessage
   private connected = false
@@ -146,6 +147,8 @@ export class CodexChannelTarget implements RuntimeTarget {
   hasActiveDelivery(replyTarget: string): boolean {
     return this.activeSource?.meta.chat_id === replyTarget
   }
+
+  isBusy(): boolean { return this.pendingDeliveries > 0 || this.threadBusy || !!this.activeTurnId }
 
   shutdown(): void {
     this.shuttingDown = true
@@ -213,7 +216,8 @@ export class CodexChannelTarget implements RuntimeTarget {
         text: interrupted ? 'Interrupt requested.' : 'No active Codex turn.',
       }, message)).then(() => {})
     }
-    const work = this.queue.catch(() => {}).then(() => this.runTurn(message))
+    this.pendingDeliveries++
+    const work = this.queue.catch(() => {}).then(() => this.runTurn(message)).finally(() => { this.pendingDeliveries-- })
     this.queue = work
     return work
   }

@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 
+import { existsSync, readFileSync } from 'node:fs'
 const [endpoint, cwd, explicitThreadId = '', mode = 'select'] = process.argv.slice(2)
 // Runtime .thread files record the selected session; they are not resume pins.
-const requestedThreadId = explicitThreadId
+const sessionFile = process.env.KA_CODEX_SESSION_FILE
+const session = mode === 'select' && sessionFile && existsSync(sessionFile) ? JSON.parse(readFileSync(sessionFile, 'utf8')) : null
+if (session && (session.schema_version !== 1 || session.cwd !== cwd || (!session.fresh && !session.threadId))) throw new Error('invalid mate session binding')
+const requestedThreadId = session ? (session.fresh ? '' : session.threadId) : explicitThreadId
 if (!endpoint || !cwd) throw new Error('usage: select-thread.mjs <endpoint> <cwd> [thread-id]')
 if (!['select', 'wait'].includes(mode)) throw new Error(`invalid selection mode: ${mode}`)
 
@@ -65,7 +69,9 @@ try {
 
   let thread
   let fresh = false
-  if (requestedThreadId) {
+  if (session?.fresh) {
+    fresh = true
+  } else if (requestedThreadId) {
     try {
       const checked = await request('thread/read', { threadId: requestedThreadId, includeTurns: false }, resumeTimeoutMs)
       if (checked.thread.cwd !== cwd) throw new Error('requested thread belongs to another workspace')
@@ -75,17 +81,33 @@ try {
       const rpc = error.rpcError
       if (rpc?.code !== -32600 || rpc.message !== `thread not loaded: ${requestedThreadId}`) throw error
     }
-    const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
-    thread = resumed.thread
+    try {
+      const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
+      thread = resumed.thread
+    } catch (error) {
+      // An empty TUI thread has no rollout until its first turn. Only an
+      // explicitly recorded empty binding may be recreated, and only on the
+      // server's precise missing-rollout response; never on a network error.
+      if (session?.unpersisted && error.rpcError?.code === -32600 && /^no rollout found for thread id /.test(error.rpcError.message)) fresh = true
+      else throw error
+    }
   }
   if (!thread && mode === 'wait') {
     const deadline = Date.now() + 15_000
     while (!thread && Date.now() < deadline) {
-      thread = notifiedThread ?? await listLatest()
+      // A sibling mate can share cwd, but cannot share this server's loaded set.
+      thread = notifiedThread
+      if (!thread) {
+        const loaded = await request('thread/loaded/list', {})
+        if (loaded.data?.length === 1) {
+          const result = await request('thread/read', { threadId: loaded.data[0], includeTurns: false })
+          if (result.thread?.cwd === cwd) thread = result.thread
+        }
+      }
       if (!thread) await new Promise(resolve => setTimeout(resolve, 100))
     }
     if (!thread) throw new Error(`timed out waiting for the TUI to create a thread in ${cwd}`)
-  } else if (!thread) {
+  } else if (!thread && !fresh) {
     const latest = await listLatest()
     if (!latest) {
       fresh = true

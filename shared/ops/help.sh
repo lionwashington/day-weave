@@ -22,6 +22,7 @@ COMMANDS
                       ka workshop stop [<name>]
                           No name: stop the whole workshop. <name>: stop one pane.
                       ka workshop restart [<name>]
+                      ka workshop new-session <name> [--dry-run|--recover]
                           No name: restart the WHOLE workshop (stop all → start
                           all; run from a plain terminal). <name>: restart one pane.
                       ka workshop spawn-mates <name> [<workdir>]

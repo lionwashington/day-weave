@@ -24,6 +24,9 @@
 #       context (--resume only restores the on-disk transcript); if you just need
 #       to reconnect a dropped channel without losing context, DON'T restart —
 #       trigger a tool call in that CC's window to re-init (telegram-channel-design A5).
+#   ka workshop new-session <name> [--dry-run|--recover]
+#       Codex only: idle-only transactional session rotation with a durable
+#       Channel hold and per-mate resume binding; run outside the target pane.
 #   ka workshop spawn-mates <name> [<workdir>]
 #       with <workdir> = registrar (add/replace yaml + launch). [P2 step ②]
 #       without        = alias for `ka workshop start <name>`.
@@ -36,8 +39,8 @@
 #       out-of-band fallback for when the channel can't reach a pane; normal comms = the channel.
 #
 # Each agent gets its own tmux pane, its own cwd (`-c`), and its own KA_CHANNEL —
-# separate processes, separate working dirs, separate channels. No cwd/context is
-# shared; the layout (pane/window) is PURELY a visual choice. The owner drives
+# separate processes and channels. Cwd may be shared, but then use per-mate
+# session bindings rather than directory-latest. Layout is purely visual. The owner drives
 # each agent from a Channel with `to <name>: …`; bare messages use sticky routing.
 #
 # Env:
@@ -75,12 +78,13 @@ INCLUDE_OPTIONAL=0
 ONLY=""
 SKIP_DAEMON=0     # --skip-daemon → don't even check the daemon (workshop never manages it)
 ASSUME_YES=0      # --yes → skip the interactive confirm on remove-mate
+RECOVER_SESSION=0
 LAYOUT="pane"     # default (P2): all CCs as split-panes in ONE window (one screen).
                   # --window → one tmux window per CC (Ctrl-b 0/1/2/w to switch).
 
 VERB="start"
 case "${1:-}" in
-    start|stop|restart|status|spawn-mates|peek|poke|remove-mate|remove) VERB="$1"; shift ;;
+    start|stop|restart|status|spawn-mates|peek|poke|remove-mate|remove|new-session) VERB="$1"; shift ;;
 esac
 
 if [ "$VERB" = "status" ]; then
@@ -97,6 +101,7 @@ for arg in "$@"; do
         --only)           : ;;  # value picked up below
         --skip-daemon)    SKIP_DAEMON=1 ;;
         --yes|-y)         ASSUME_YES=1 ;;
+        --recover)        RECOVER_SESSION=1 ;;
         --pane)           LAYOUT="pane" ;;
         --window)         LAYOUT="window" ;;
         --*)              log_warn "unknown flag: $arg" ;;
@@ -634,6 +639,22 @@ cmd_spawn_mates() {
 #     on-disk transcript). If a channel merely dropped (e.g. after a daemon
 #     restart), let the runtime's reconnect path recover before restarting.
 # ============================================================================
+cmd_new_session() {
+    [ -n "$TARGET" ] || { log_err 'usage: ka workshop new-session <mate> [--dry-run|--recover]'; return 2; }
+    build_entries
+    [ "${#ENTRY_NAMES[@]}" = 1 ] && [ "${ENTRY_RUNTIMES[0]}" = codex ] || { log_err 'new-session requires one configured Codex mate'; return 2; }
+    local channel="${ENTRY_CHANNELS[0]}" pane_id
+    pane_id="$(find_pane_by_channel "$channel" || true)"
+    if [ -n "${TMUX_PANE:-}" ] && [ "$pane_id" = "$TMUX_PANE" ]; then
+        log_err 'Run new-session from another mate or terminal, not the target pane'; return 2
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "[dry-run] idle-check → hold messages → new thread → restart '$TARGET' → verify → release; rollback on failure"
+        return
+    fi
+    node "$KA_RUNTIMES_DIR/codex/new-session.mjs" "$TARGET" "$channel" "${ENTRY_CWDS[0]}" "$0" "$PORT" "$RECOVER_SESSION"
+}
+
 cmd_restart() {
     if [ -z "$TARGET" ]; then
         # Whole-workshop restart (was the top-level `ka restart`): stop all → start all.
@@ -761,6 +782,7 @@ case "$VERB" in
     start)              cmd_start ;;
     stop)               cmd_stop ;;
     restart)            cmd_restart ;;
+    new-session)        cmd_new_session ;;
     spawn-mates)        cmd_spawn_mates ;;
     remove-mate|remove) cmd_remove_mate ;;
     *)                  log_err "unknown verb: $VERB"; exit 2 ;;

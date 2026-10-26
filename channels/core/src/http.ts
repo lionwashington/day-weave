@@ -217,6 +217,14 @@ export function createHttpApp(platform: Platform, runtimeManager?: CodexRuntimeM
     }
   })
 
+  app.post('/api/runtimes/codex/:name/session-switch', async (req, res) => {
+    if (!runtimeManager) { res.status(503).json({ ok: false }); return }
+    try {
+      const result = await runtimeManager.sessionSwitch(sanitizeChannelName(req.params.name), String(req.body?.action ?? ''), req.body?.thread_id, req.body?.cwd)
+      res.json({ ok: true, result })
+    } catch (error: any) { res.status(409).json({ ok: false, error: error.message }) }
+  })
+
   app.delete('/api/runtimes/codex/:name', async (req, res) => {
     if (!runtimeManager) { res.status(503).json({ ok: false, error: 'Codex runtime routing is unavailable' }); return }
     const name = sanitizeChannelName(req.params.name)

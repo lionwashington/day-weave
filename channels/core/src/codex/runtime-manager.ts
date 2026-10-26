@@ -1,12 +1,13 @@
 import { AppServerClient } from './app-server-client.ts'
 import { CodexChannelTarget, type CodexChannelEvent } from './channel-target.ts'
+import { SwitchBuffer } from './switch-buffer.ts'
 import { BindingStore, type ChannelPlatform } from '../bindings.ts'
 import { registerRuntimeTarget, unregisterRuntimeTarget } from '../targets.ts'
 import { channelNumberOf } from '../sessions.ts'
 import type { Platform } from '../platform.ts'
 import { log } from '../log.ts'
 import { counters } from '../counters.ts'
-import { mkdirSync, writeFileSync, renameSync } from 'node:fs'
+import { mkdirSync, writeFileSync, renameSync, existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -50,11 +51,62 @@ export class CodexRuntimeManager {
   private readonly connectingClients = new Map<string, AppServerClient>()
   private readonly generations = new Map<string, number>()
   private stopped = false
+  private readonly switches = new Map<string, SwitchBuffer>()
 
   constructor(platform: Platform, config: CodexRuntimeConfig) {
     this.platform = platform
     this.config = config
     this.bindings = new BindingStore(config.bindingsPath)
+    const dir = join(dirname(config.bindingsPath), 'session-switches')
+    if (existsSync(dir)) for (const file of readdirSync(dir)) {
+      if (!/^[a-z0-9_-]+\.json$/.test(file)) continue
+      if (!JSON.parse(readFileSync(join(dir, file), 'utf8')).held) continue
+      const name = file.slice(0, -5)
+      const buffer = new SwitchBuffer(name, join(dir, file))
+      this.switches.set(name, buffer)
+      registerRuntimeTarget(buffer)
+    }
+  }
+
+  async sessionSwitch(name: string, action: string, expectedThread?: string, expectedCwd?: string): Promise<unknown> {
+    return this.serialize(name, async () => {
+      const managed = this.targets.get(name)
+      if (action === 'status') return { held: this.switches.has(name), threadId: managed?.registration.threadId, cwd: managed?.registration.cwd, alive: managed?.target.isAlive() ?? false }
+      if (action === 'begin' || action === 'begin-new') {
+        if (this.switches.has(name)) throw new Error('session switch already held; recover before starting another')
+        if (action === 'begin-new') {
+          if (managed || !expectedCwd?.startsWith('/')) throw new Error('first session requires an unregistered mate and absolute cwd')
+        } else {
+          if (!managed || !managed.target.isAlive() || managed.target.isBusy()) throw new Error('mate is offline or busy')
+          if (managed.registration.allowUnpersistedThread) throw new Error('current thread has not persisted; complete its first turn before rotating')
+          if (managed.registration.cwd !== expectedCwd) throw new Error('channel workspace mismatch')
+          if (expectedThread && managed.registration.threadId !== expectedThread) throw new Error('thread changed before session switch')
+          const checked = await managed.client.request('thread/read', { threadId: managed.registration.threadId, includeTurns: false })
+          if (checked.thread?.status?.type !== 'idle' || managed.target.isBusy()) throw new Error('mate is not idle')
+        }
+        const file = join(dirname(this.config.bindingsPath), 'session-switches', `${name}.json`)
+        const buffer = new SwitchBuffer(name, file)
+        buffer.state.held = true
+        // Persist the hold before replacing routing; retain prior audit entries.
+        writeFileSync(file + '.tmp', JSON.stringify(buffer.state), { mode: 0o600 }); renameSync(file + '.tmp', file)
+        if (managed) unregisterRuntimeTarget(name, managed.target)
+        registerRuntimeTarget(buffer)
+        this.switches.set(name, buffer)
+        return { threadId: managed?.registration.threadId, cwd: managed?.registration.cwd ?? expectedCwd }
+      }
+      if (action !== 'release') throw new Error('invalid session switch action')
+      const buffer = this.switches.get(name)
+      if (!managed?.target.isAlive() || managed.registration.threadId !== expectedThread) throw new Error('session switch target not ready')
+      if (!buffer || buffer.draining) return { released: true, threadId: expectedThread }
+      // Keep the buffer visible until all queued messages have been dispatched.
+      void buffer.drain(managed.target).then(() => {
+        if (this.stopped || this.targets.get(name) !== managed) return
+        unregisterRuntimeTarget(name, buffer)
+        registerRuntimeTarget(managed.target)
+        this.switches.delete(name)
+      }).catch(() => log(`session switch queue retained for ${name}; recovery required`))
+      return { released: true, threadId: expectedThread }
+    })
   }
 
   register(item: CodexRuntimeRegistration): Promise<void> {
@@ -132,7 +184,7 @@ export class CodexRuntimeManager {
       if (cancelled()) throw new Error('runtime registration cancelled')
       await target.connect()
       if (cancelled()) throw new Error('runtime registration cancelled')
-      registerRuntimeTarget(target)
+      if (!this.switches.has(item.name)) registerRuntimeTarget(target)
       this.targets.set(item.name, { target, client, registration: { ...item } })
       log(`codex target registered: ${item.name} (${item.endpoint ?? item.socketPath})`)
     } catch (error) {
@@ -169,6 +221,7 @@ export class CodexRuntimeManager {
     this.stopped = true
     const names = new Set([...this.targets.keys(), ...this.registrationQueues.keys()])
     await Promise.all(Array.from(names, name => this.unregister(name)))
+    for (const [name, buffer] of this.switches) unregisterRuntimeTarget(name, buffer)
     for (const stream of this.streams.values()) if (stream.timer) clearTimeout(stream.timer)
     this.streams.clear()
   }
