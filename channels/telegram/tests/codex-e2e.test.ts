@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -62,6 +62,34 @@ test('Telegram routes an owner message through a persistent Codex target', async
     assert.ok(telegram.sent().some(message =>
       message.text === '**[#1-codex-main]**\n\necho:hello',
     ), `channel prefix must be a separate paragraph: ${JSON.stringify(telegram.sent())}`)
+
+    // Real HTTP failures, real channel + real App Server bridge; only remote
+    // services are synthetic. Unknown placeholder outcome must not lose body.
+    for (const accepted of [false, true]) {
+      const attempts = telegram.sendAttempts()
+      const before = JSON.parse(readFileSync(statePath, 'utf8')).requests.filter((r: any) => r.method === 'turn/start').length
+      telegram.failNextSends(1, accepted)
+      const content = `placeholder-loss-${accepted}`
+      const response = await fetch(`${daemon.baseUrl}/api/runtimes/codex/codex-main/deliver`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }),
+      })
+      assert.equal(response.ok, true)
+      assert.equal(await waitFor(() => telegram.sent().some(m => m.text.includes(`echo:${content}`)), 5_000), true)
+      assert.equal(telegram.sent().filter(m => m.text.includes(`echo:${content}`)).length, 1)
+      assert.equal(telegram.sendAttempts() - attempts, 2, 'one placeholder and one body, no retries')
+      assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).requests.filter((r: any) => r.method === 'turn/start').length - before, 1)
+    }
+
+    // Both sends lost: retain final, no automatic body replay or model retry.
+    const attempts = telegram.sendAttempts()
+    telegram.failNextSends(2, true)
+    await fetch(`${daemon.baseUrl}/api/runtimes/codex/codex-main/deliver`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'body-ack-lost' }),
+    })
+    const undelivered = join(daemon.dataDir, 'undelivered')
+    assert.equal(await waitFor(() => existsSync(undelivered) && readdirSync(undelivered).length > 0, 5_000), true)
+    assert.equal(telegram.sendAttempts() - attempts, 2)
+    assert.equal(telegram.sent().filter(m => m.text.includes('echo:body-ack-lost')).length, 1)
 
     const longBody = 'x'.repeat(5_000)
     const beforeLongReply = telegram.sent().length

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Sandbox CLI launcher: do not load the operator's login profile or nvm for
+# the synthetic CLI. Preserve actual command arguments and use a real shell.
+if [ "$1" = '-lc' ]; then
+  case "$2" in
+    'export NVM_DIR='*'; '*) exec /bin/bash -c "${2#*; }" ;;
+  esac
+fi
+exec /bin/bash "$@"

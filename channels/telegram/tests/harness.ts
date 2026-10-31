@@ -17,6 +17,8 @@ const PKG_DIR = dirname(fileURLToPath(import.meta.url)).replace(/\/tests$/, '')
 export type TgUpdate = Record<string, any>
 
 export interface MockTelegram {
+  failNextSends(n: number, accepted?: boolean): void
+  sendAttempts(): number
   url: string
   port: number
   /** Queue an update to be returned by the next getUpdates poll. */
@@ -43,6 +45,8 @@ export async function startMockTelegram(): Promise<MockTelegram> {
   const sentMsgs: Array<{ chat_id: string; text: string }> = []
   const actions: Array<{ chat_id: string; action: string }> = []
   let hang = false
+  let sendFailures = 0, sendAttempts = 0
+  let acceptFailedSend = false
   let getUpdatesCount = 0
   let downloadFailures = 0  // when >0, the next N file downloads abort (transient-failure injection)
   let delayedDownloads = 0
@@ -64,6 +68,13 @@ export async function startMockTelegram(): Promise<MockTelegram> {
     }
   })
   app.post('/bot:token/sendMessage', (req, res) => {
+    sendAttempts++
+    if (sendFailures > 0) {
+      sendFailures--
+      if (acceptFailedSend) sentMsgs.push({ chat_id: String(req.body?.chat_id ?? ''), text: String(req.body?.text ?? '') })
+      res.destroy()
+      return
+    }
     sentMsgs.push({ chat_id: String(req.body?.chat_id ?? ''), text: String(req.body?.text ?? '') })
     res.json({ ok: true, result: { message_id: sentMsgs.length, date: Math.floor(Date.now() / 1000), chat: { id: req.body?.chat_id }, text: req.body?.text } })
   })
@@ -103,6 +114,8 @@ export async function startMockTelegram(): Promise<MockTelegram> {
   return {
     url: `http://127.0.0.1:${port}`,
     port,
+    failNextSends: (n, accepted = false) => { sendFailures = n; acceptFailedSend = accepted },
+    sendAttempts: () => sendAttempts,
     push: u => pending.push(u),
     sent: () => sentMsgs,
     chatActions: () => actions,

@@ -1,15 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CodexRuntimeManager } from '../../channels/core/src/codex/runtime-manager.ts'
+import { CodexRuntimeManager, deliveryFailureKind } from '../../channels/core/src/codex/runtime-manager.ts'
 import { retryTelegramEdit, canRetryTelegramSend } from '../../channels/telegram/retry-edit.ts'
 import { startFakeSocketServer } from '../codex-app-server/fake-socket-server.mjs'
 import { fileURLToPath } from 'node:url'
 import { dispatchTargets } from '../../channels/core/src/dispatch.ts'
 
 test('edit retries are bounded, idempotent, and never expose error credentials', async () => {
+  assert.equal(deliveryFailureKind({ error_code: 403, message: 'synthetic-secret' }), 'api-403')
+  assert.equal(deliveryFailureKind(Error('Network request failed synthetic-secret')), 'network-unknown-outcome')
+  assert.equal(deliveryFailureKind(Error('synthetic-secret')), 'unknown')
   assert.equal(canRetryTelegramSend({ error_code: 429, parameters: { retry_after: 1 } }), true)
   for (const error of [{ error_code: 500 }, { name: 'HttpError' }, Error('ECONNRESET'), { error_code: 403 }, { error_code: 429, parameters: { retry_after: 60 } }]) {
     assert.equal(canRetryTelegramSend(error), false)
@@ -50,9 +53,10 @@ for (const mode of ['start', 'update', 'finish', 'send'] as const) {
       await dispatchTargets(platform, ['delivery-test'], 'synthetic hello', { chat_id: 'owner' })
       await new Promise(resolve => setTimeout(resolve, 300))
       assert.deepEqual(unhandled, [])
-      assert.equal(sends, mode === 'send' ? 1 : 0)
+      assert.equal(sends, mode === 'send' || mode === 'start' ? 1 : 0)
       assert.equal(finishes, mode === 'send' || mode === 'start' ? 0 : 1)
-      if (mode !== 'update') {
+      if (mode === 'start' || mode === 'update') assert.equal(existsSync(join(dir, 'undelivered')), false)
+      if (mode === 'finish' || mode === 'send') {
         const files = readdirSync(join(dir, 'undelivered'))
         assert.equal(files.length, 1)
         const file = join(dir, 'undelivered', files[0])
@@ -66,6 +70,43 @@ for (const mode of ['start', 'update', 'finish', 'send'] as const) {
       await manager.stop(); await server.close(); process.off('unhandledRejection', listener)
     }
   })
+}
+
+for (const platformName of ['telegram', 'lark']) {
+  for (const eventType of ['final', 'error', 'turn-completed']) {
+    for (const sendFails of [false, true]) {
+      test(`${platformName}: delayed placeholder rejection, ${eventType}, body failure=${sendFails}`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'delivery-race-'))
+        const sent: string[] = []
+        const platform: any = {
+          name: platformName, resolveReplyTarget: () => 'allowed-owner',
+          startStream: async () => { await new Promise(r => setTimeout(r, 30)); throw Error('private transport details') },
+          updateStream: async () => { assert.fail('cannot edit nonexistent placeholder') },
+          finishStream: async () => { assert.fail('cannot finalize nonexistent placeholder') },
+          send: async (target: string, body: string) => {
+            assert.equal(target, 'allowed-owner'); sent.push(body)
+            if (sendFails) throw Error('private transport details')
+            return null
+          },
+        }
+        const manager = new CodexRuntimeManager(platform, { platform: platformName as any, bindingsPath: join(dir, 'bindings.json'), externalChatId: 'owner' })
+        const emit = (manager as any).onEvent.bind(manager)
+        try {
+          await emit('test', { type: 'turn-started', turnId: 't' }, 'untrusted')
+          await emit('test', { type: 'text-delta', turnId: 't', delta: 'draft' }, 'untrusted')
+          await emit('test', { type: eventType, turnId: 't', text: 'answer', status: 'completed', error: { message: 'synthetic model failure' } }, 'untrusted')
+          await emit('test', { type: 'turn-completed', turnId: 't', status: 'completed' }, 'untrusted')
+          assert.equal(sent.length, 1, 'never retry an ambiguous body send')
+          assert.equal((manager as any).streams.size, 0)
+          if (eventType === 'final' && sendFails) {
+            const files = readdirSync(join(dir, 'undelivered'))
+            assert.equal(files.length, 1)
+            assert.equal(JSON.parse(readFileSync(join(dir, 'undelivered', files[0]), 'utf8')).text, 'answer')
+          }
+        } finally { await manager.stop() }
+      })
+    }
+  }
 }
 
 test('a rejected Lark preview is observed and does not block finalization', async () => {

@@ -32,6 +32,7 @@ export interface CodexRuntimeConfig {
 type ManagedTarget = { target: CodexChannelTarget; client: AppServerClient; registration: CodexRuntimeRegistration }
 
 interface ActiveStream {
+  target: string
   prefix: string
   text: string
   handle: Promise<unknown>
@@ -239,9 +240,9 @@ export class CodexRuntimeManager {
     // back into the model's error event (which would send another failing reply).
     try {
       await this.deliverEvent(name, event, replyTarget)
-    } catch {
+    } catch (error) {
       counters.repliesFailed++
-      log(`channel delivery failed for ${name} (event=${event.type}); model status unchanged`)
+      log(`channel delivery failed for ${name} (event=${event.type}, kind=${deliveryFailureKind(error)}); model status unchanged`)
       if (event.type === 'final') {
         try {
           const dir = join(dirname(this.config.bindingsPath), 'undelivered')
@@ -266,11 +267,11 @@ export class CodexRuntimeManager {
       const target = this.platform.resolveReplyTarget(replyTarget)
       if (target) {
         const prefix = `**[#${channelNumberOf(name)}-${name}]**\n\n`
-        const stream: ActiveStream = { prefix, text: '', handle: Promise.resolve(null), lastUpdate: 0 }
+        const stream: ActiveStream = { target, prefix, text: '', handle: Promise.resolve(null), lastUpdate: 0 }
         // Attach the rejection handler immediately, even before the first delta.
-        stream.handle = Promise.resolve().then(() => this.platform.startStream!(target, `${prefix}…`)).catch(() => {
+        stream.handle = Promise.resolve().then(() => this.platform.startStream!(target, `${prefix}…`)).catch(error => {
           stream.startFailed = true
-          log(`channel stream placeholder failed for ${name}; preview suspended`)
+          log(`channel stream placeholder failed for ${name} (kind=${deliveryFailureKind(error)}); preview suspended; final body will be attempted`)
           return null
         })
         this.streams.set(event.turnId, stream)
@@ -311,7 +312,9 @@ export class CodexRuntimeManager {
         const streamError = await this.finishStream(event.turnId!, stream, `${stream.text}${suffix}`)
           .catch(error => error?.message ?? String(error))
         if (!streamError) return
-        log(`codex stream failure fallback failed: ${streamError}`)
+        // finishStream may already have sent a body after placeholder failure.
+        // Its outcome can be ambiguous: never issue a second body send.
+        throw new Error('channel error response delivery failed')
       }
       const target = this.platform.resolveReplyTarget(replyTarget)
       if (target) await this.platform.send(target, `⚠️ ${name}: Codex turn failed: ${event.error.message}`)
@@ -335,7 +338,10 @@ export class CodexRuntimeManager {
       if (stream.timer) clearTimeout(stream.timer)
       if (stream.update) await stream.update
       const handle = await stream.handle
-      if (stream.startFailed) throw new Error('channel stream creation failed')
+      // Only the placeholder was attempted, never the answer. Even when its
+      // outcome is unknown, a separate body send cannot duplicate the answer.
+      // Do not apply this fallback to failed final edits or multipart sends.
+      if (stream.startFailed) return await this.platform.send(stream.target, `${stream.prefix}${text}`)
       return await this.platform.finishStream!(handle, `${stream.prefix}${text}`)
     } finally {
       this.streams.delete(turnId)
@@ -369,6 +375,14 @@ export class CodexRuntimeManager {
     if (!managed) throw new Error(`approval request for unknown Codex thread: ${threadId}`)
     return managed.target.requestApproval(request)
   }
+}
+
+// Never log raw transport errors: URLs can contain bot tokens or webhooks.
+export function deliveryFailureKind(error: any): string {
+  const code = Number(error?.error_code ?? error?.response?.error_code)
+  if (Number.isInteger(code) && code >= 400 && code <= 599) return `api-${code}`
+  if (error?.name === 'HttpError' || /Network request|ECONNRESET|ETIMEDOUT|fetch failed/i.test(String(error?.message ?? ''))) return 'network-unknown-outcome'
+  return 'unknown'
 }
 
 function completionNotice(status: string): string {

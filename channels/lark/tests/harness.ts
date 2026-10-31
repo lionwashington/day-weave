@@ -77,6 +77,8 @@ export async function startDaemon(opts: {
   const chatId = opts.chatId ?? 'oc_test'
   const fakeCli = join(PKG_DIR, 'tests', 'fake-lark-cli.sh')
   try { chmodSync(fakeCli, 0o755) } catch {}
+  const mockBin = join(PKG_DIR, 'tests', 'mock-bin')
+  chmodSync(join(mockBin, 'bash'), 0o755)
 
   // Two-bucket data, same as prod: config.yaml (non-secret) + secrets.yaml
   // (self_open_id + group webhooks) in the config dir the daemon resolves via
@@ -96,6 +98,7 @@ export async function startDaemon(opts: {
     KA_CONFIG_DIR: dataDir,
     KA_PLATFORM_MODULE: join(PKG_DIR, 'lark-platform.ts'),
     LARK_MOCK_DIR: mockDir,
+    PATH: `${mockBin}:${process.env.PATH ?? ''}`,
   }
   if (opts.cardKitFail) env.LARK_MOCK_CARDKIT_FAIL = '1'
   if (opts.cardKitUpdateFail) env.LARK_MOCK_CARDKIT_UPDATE_FAIL = '1'
