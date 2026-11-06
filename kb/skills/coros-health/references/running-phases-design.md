@@ -1,8 +1,7 @@
-# Adaptive running phases — sandbox design
+# Adaptive running phases — production contract
 
-Status: experimental pure module `scripts/running-phases.mjs`; NOT connected to
-`sync`, `rebuild`, `analyze-latest`, or `compare`. Existing caches and CLI behavior
-are deliberately unchanged pending review. This is not a production fix claim.
+Detector version 1 is used by `sync`, `rebuild`, `analyze-latest`, `compare`, CSV
+and baseline outputs. Activity schema 2 / algorithm 3 require offline migration.
 
 ## Contract
 
@@ -12,16 +11,20 @@ Output status is `cruise_acceleration`, `steady_only`, or `unknown`; inference i
 never user confirmation. Unknowns retain candidate boundaries and reasons, not
 authoritative phase metrics. A verified annotation overrides automatic evidence.
 
-Prototype resolution is the input lap boundary, including sub-kilometre laps.
-It cannot locate a transition inside a kilometre from kilometre averages. A later
-record-level adapter must decode timestamp/distance/HR/cadence/power/altitude,
-respect timer start/stop events, reject gaps, and create distance bins before
-claiming finer resolution. Do not interpolate a pause or invent HR coverage.
+Lap inference uses actual lap boundaries. If complete timestamp/distance records
+are available, a refinement pass builds approximately 500m bins and prefers a
+supported record-based boundary. It rejects pauses (>10s elapsed/timer difference),
+nonpositive increments, time gaps >15s, distance jumps >100m, implausible speed,
+or >2% discrepancy from session distance/timer. It never bridges stop events or
+guesses missing timer time. Missing records fall back to lap resolution with a
+warning. Bin indices are explicitly distinct from lap indices; boundaries are
+approximate, not exact physiological transition times. Known lap-level pause or
+downhill confounds cannot be bypassed by record refinement.
 
 ## Deterministic candidate scoring
 
 For each candidate split, evaluate the entire prefix and suffix, without a fixed
-finish length. Prototype defaults (engineering heuristics, not physiological
+finish length. Defaults (engineering heuristics, not physiological
 thresholds or calibrated probabilities):
 
 - At least 2 km preceding cruise, 700 m and 120 s of sustained acceleration.
@@ -57,22 +60,33 @@ phases; never replace missing cruise metrics with whole-run averages. Keep
 confirmed vs inferred cohorts, device/temperature and same-distance cohorts
 visible. Duration differences are not proof of improved fitness.
 
-## Production integration plan (not yet executed)
+## Migration, overrides and consistency
 
-1. Normalize descent and sensor coverage from FIT. Add the record-level adapter
-   and evaluate boundary accuracy with independent labeled cases.
-2. Add versioned `running_phases` to activities; retain old fixed metrics under
-   explicitly legacy names rather than silently changing their meaning.
-3. Update Skill interpretation, CSV, baseline cache, `compare` and latest output
-   together. Read commands must report stale versions rather than silently using
-   old fixed-segment caches or triggering writes.
-4. Add explicit boundary annotation editing, validation, provenance and incremental
-   invalidation keyed by FIT hash, annotation hash, detector version/config.
-   Old `finish_1k` labels do not specify a general phase boundary: queue for review.
-5. Offline rebuild from existing FIT into a sandbox, verify idempotency and raw
-   hashes, then release only after approval. No FIT downloads or OAuth access.
-6. Production migration should atomically publish coherent derived datasets and
-   preserve a rollback copy; retain raw observations/FIT and user overrides.
+Run `rebuild --fit-only` offline after upgrade, preserving a private rollback copy
+of `derived/` and `state/` first. Raw FIT and wellness are untouched. Normalized
+rows reuse unchanged FIT+metadata+annotation+algorithm input hashes. Repeating
+rebuild with identical inputs and intact outputs skips all writes. Sync also
+detects annotation changes. Explicit boundary edits recompute only the affected
+activity, then regenerate aggregate files.
+
+Use `annotate-phase --activity-id ID --cruise-end-lap N`, or `--status steady_only`
+/ `--status unknown`. Store under `state/annotations.json` as `running_phases`;
+the command preserves previous labels and appends `phase_history`. Identical
+corrections are no-ops. Old `finish_1k` labels alone are not a general phase
+boundary and emit a review warning; never silently relabel a different kilometre.
+
+Activity CLI writers take `state/activity-write.lock`. Live locks are not removed
+automatically. In an interrupted writer, verify its PID is dead before removing
+the lock and rebuilding. Strict rebuild validates all FIT before publishing.
+Each file is atomically replaced, then a checksum manifest is written to state
+last. Read commands reject stale algorithms, changed annotations or inconsistent
+files instead of using a partially published cache. This is fail-closed multi-file
+publication, not a filesystem-wide transaction. Readers remain offline/read-only.
+
+Legacy fixed-distance metrics exist only under `legacy_fixed_segments`, never in
+current comparison calculations. `comparisons.*.phases` includes distances,
+durations and metric counts; the old `steady_*`/`finish_*` comparison keys now alias
+the actual cruise/acceleration metrics. Device groups also use actual phases.
 
 ## Validation scope
 

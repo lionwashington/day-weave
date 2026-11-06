@@ -90,7 +90,22 @@ FIT running cadence commonly represents one-foot strides per minute. Values belo
 
 A complete kilometre lap has distance from 950 through 1050 metres. Sort laps by start time or message order before selecting segments.
 
-### Steady first 5 km
+### Actual running phases (schema 2 / algorithm 3)
+
+`running_phases` is the authoritative analysis. It contains `version`, `status`,
+`classification`, `confidence`, `resolution`, `reasons`, `warnings`, candidate
+boundaries, and `cruise` / `acceleration` / `remainder` metrics. Segment distances
+and durations are variable. See [running-phase rules](running-phases-design.md).
+Unknown segments are null and excluded from phase statistics. HR/EF require full
+HR coverage; phase pace uses measured distance and timer-first effective time.
+`input_hash` keys incremental activity reuse. State stores `annotations_hash` and
+`derived_hashes` to prevent stale or inconsistent comparisons. Activity sync and
+wellness retain independent versions.
+
+### Legacy steady first 5 km
+
+The following two calculations are retained only in `legacy_fixed_segments`.
+They are not used by current cruise/acceleration comparisons.
 
 Select the first five complete kilometre laps only.
 
@@ -99,7 +114,7 @@ Select the first five complete kilometre laps only.
 - `pace_s_per_km`: `timer_time_s / 5`.
 - `ef`: `(5000 / timer_time_s * 60) / avg_hr`.
 
-### Finishing kilometre
+### Legacy finishing kilometre
 
 Select the sixth complete kilometre lap only. Preserve its timer time, pace, average/maximum heart rate, average cadence and maximum speed.
 

@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import {
   copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync,
-  realpathSync, unlinkSync, writeFileSync,
+  realpathSync, unlinkSync, writeFileSync, openSync, closeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -12,9 +12,10 @@ import {
   officialOauth, rebuildWellness, syncWellness, validateWellness, wellnessPaths, wellnessTrend,
 } from './coros-wellness.mjs';
 import { syncDetails, readDetails } from './coros-details.mjs';
+import { detectActivityPhases, compareRunningPhases, PHASE_VERSION } from './running-phases.mjs';
 
-export const SCHEMA_VERSION = 1;
-export const ALGORITHM_VERSION = 2;
+export const SCHEMA_VERSION = 2;
+export const ALGORITHM_VERSION = 3;
 const DEFAULT_API_URL = 'https://teamcnapi.coros.com';
 const MIN_FIT_BYTES = 64;
 const FULL_KM_MIN_M = 950;
@@ -116,8 +117,8 @@ function ensureLayout(paths) {
     '',
     'Derived files are rebuildable; raw FIT files are not modified by rebuild.',
     '',
-    'EF = speed (metres/minute) / average heart rate. First-5-km EF = (5000 / timer_seconds * 60) / time-weighted average HR. Timer time is preferred over elapsed time.',
-    'The steady segment uses only the first five complete 1 km laps. The finishing segment uses only the sixth complete 1 km lap.',
+    'EF = phase speed (metres/minute) / time-weighted average heart rate. Timer time is preferred over elapsed time.',
+    'running_phases contains detected or user-confirmed cruise and acceleration phases of variable length. legacy_fixed_segments is historical compatibility data, not actual phases.',
     '',
   ].join('\n'));
 }
@@ -302,6 +303,7 @@ function normalizeLap(lap, index, id) {
     max_speed_mps: number(lap.enhancedMaxSpeed, lap.maxSpeed),
     avg_temperature_c: number(lap.avgTemperature),
     total_ascent_m: number(lap.totalAscent),
+    total_descent_m: number(lap.totalDescent),
     complete_km: distance !== null && distance >= FULL_KM_MIN_M && distance <= FULL_KM_MAX_M,
   };
 }
@@ -396,7 +398,11 @@ export function normalizeActivity(metadata, messages, annotation = null) {
     training_load: number(metadata.trainingLoad),
     laps,
   };
-  Object.assign(activity, calculateSegments(laps, distance, annotation));
+  activity.legacy_fixed_segments = calculateSegments(laps, distance, annotation);
+  if (activity.is_running) {
+    activity.running_phases = detectActivityPhases(laps, messagesOf(messages, 'recordMesgs'), session, annotation?.running_phases);
+    if (annotation?.finish_1k || typeof annotation === 'string') activity.running_phases.warnings.push('legacy_finish_label_needs_boundary_confirmation');
+  }
   return activity;
 }
 
@@ -434,8 +440,8 @@ function stats(rows) {
   const metrics = ['pace_s_per_km', 'avg_hr', 'ef', 'finish_pace_s_per_km', 'finish_avg_hr'];
   const out = { count: rows.length };
   for (const metric of metrics) {
-    const values = rows.map((row) => metric === 'ef' ? row.steady_5k?.ef : metric === 'finish_pace_s_per_km' ? row.finish_1k?.pace_s_per_km : metric === 'finish_avg_hr' ? row.finish_1k?.avg_hr : metric === 'pace_s_per_km' ? row.steady_5k?.pace_s_per_km ?? row.pace_s_per_km : row.steady_5k?.avg_hr ?? row.avg_hr).filter(Number.isFinite);
-    out[metric] = { mean: mean(values), median: median(values) };
+    const values = rows.map((row) => metric === 'ef' ? row.running_phases?.cruise?.ef : metric === 'finish_pace_s_per_km' ? row.running_phases?.acceleration?.pace_s_per_km : metric === 'finish_avg_hr' ? row.running_phases?.acceleration?.avg_hr : metric === 'pace_s_per_km' ? row.running_phases?.cruise?.pace_s_per_km : row.running_phases?.cruise?.avg_hr).filter(Number.isFinite);
+    out[metric] = { count: values.length, mean: mean(values), median: median(values) };
   }
   return out;
 }
@@ -450,27 +456,42 @@ function buildBaselines(activities) {
     generated_at: new Date().toISOString(),
     all_runs: stats(runs),
     devices,
-    finish_user: stats(runs.filter((x) => x.finish_1k?.classification === 'user')),
-    finish_inferred: stats(runs.filter((x) => x.finish_1k?.classification === 'inferred')),
+    finish_user: stats(runs.filter((x) => x.running_phases?.acceleration && x.running_phases.classification === 'user')),
+    finish_inferred: stats(runs.filter((x) => x.running_phases?.acceleration && x.running_phases.classification === 'inferred')),
   };
 }
 
-export function rebuild(paths, { strict = false } = {}) {
+export function rebuild(paths, { strict = false, wellness = true } = {}) {
   ensureLayout(paths);
   const metadata = readJson(paths.activities, []);
-  const annotations = readJson(paths.annotations, {});
+  const annotations = readAnnotations(paths);
+  const oldState = readJson(paths.state, {});
+  const intactCache = JSON.stringify(oldState.derived_hashes) === JSON.stringify(derivedHashes(paths));
+  const oldRows = new Map((intactCache ? loadDerived(paths) : []).map(x => [x.activity_id, x]));
   const normalized = [];
   const invalid = [];
+  let reused = 0;
   for (const meta of metadata) {
     let id;
     try { id = activityId(meta); } catch { invalid.push({ activity_id: null, reason: 'invalid_metadata_id' }); continue; }
     const path = join(paths.fitDir, `${id}.fit`);
     const check = inspectFitFile(path);
     if (!check.valid) { invalid.push({ activity_id: id, reason: check.reason }); continue; }
-    try { normalized.push(normalizeActivity(meta, decodeFit(path), annotations[id])); }
+    try {
+      const inputHash = createHash('sha256').update(readFileSync(path)).update(JSON.stringify([meta, annotations[id] ?? null, SCHEMA_VERSION, ALGORITHM_VERSION, PHASE_VERSION])).digest('hex');
+      const old = oldRows.get(id);
+      if (old?.input_hash === inputHash) reused++;
+      normalized.push(old?.input_hash === inputHash ? old : { ...normalizeActivity(meta, decodeFit(path), annotations[id]), input_hash: inputHash });
+    }
     catch (error) { invalid.push({ activity_id: id, reason: error.message }); }
   }
   normalized.sort((a, b) => (a.start_time || a.date || '').localeCompare(b.start_time || b.date || '') || a.activity_id.localeCompare(b.activity_id));
+  if (strict && invalid.length) throw new Error(`${invalid.length} missing or invalid FIT files; derived cache unchanged`);
+  const prior = readJson(paths.state, {});
+  if (reused === metadata.length && reused === oldRows.size && prior.schema_version === SCHEMA_VERSION && prior.algorithm_version === ALGORITHM_VERSION
+      && prior.annotations_hash === annotationsHash(paths) && JSON.stringify(prior.derived_hashes) === JSON.stringify(derivedHashes(paths))) {
+    return { parsed: normalized.length, running: normalized.filter(x => x.is_running).length, invalid_count: 0, invalid: [], reused, recomputed: 0, skipped: true };
+  }
   atomicWrite(paths.activitiesJsonl, normalized.map((x) => JSON.stringify(x)).join('\n') + (normalized.length ? '\n' : ''));
   const runs = normalized.filter((x) => x.is_running);
   const runRows = runs.map((x) => ({
@@ -480,12 +501,17 @@ export function rebuild(paths, { strict = false } = {}) {
     avg_cadence_spm: x.avg_cadence_spm, avg_power_w: x.avg_power_w,
     avg_temperature_c: x.avg_temperature_c, total_ascent_m: x.total_ascent_m,
     calories_kcal: x.calories_kcal, training_load: x.training_load,
-    steady_5k_time_s: x.steady_5k?.timer_time_s, steady_5k_pace_s_per_km: x.steady_5k?.pace_s_per_km,
-    steady_5k_avg_hr: x.steady_5k?.avg_hr, steady_5k_ef: x.steady_5k?.ef,
-    finish_1k_time_s: x.finish_1k?.timer_time_s, finish_1k_pace_s_per_km: x.finish_1k?.pace_s_per_km,
-    finish_1k_avg_hr: x.finish_1k?.avg_hr, finish_1k_max_hr: x.finish_1k?.max_hr,
-    finish_1k_cadence_spm: x.finish_1k?.avg_cadence_spm, finish_1k_max_speed_mps: x.finish_1k?.max_speed_mps,
-    finish_classification: x.finish_1k?.classification,
+    phase_status: x.running_phases?.status, phase_classification: x.running_phases?.classification,
+    phase_confidence: x.running_phases?.confidence,
+    cruise_distance_m: x.running_phases?.cruise?.distance_m,
+    cruise_time_s: x.running_phases?.cruise?.effective_time_s,
+    cruise_pace_s_per_km: x.running_phases?.cruise?.pace_s_per_km,
+    cruise_avg_hr: x.running_phases?.cruise?.avg_hr, cruise_ef: x.running_phases?.cruise?.ef,
+    acceleration_distance_m: x.running_phases?.acceleration?.distance_m,
+    acceleration_time_s: x.running_phases?.acceleration?.effective_time_s,
+    acceleration_pace_s_per_km: x.running_phases?.acceleration?.pace_s_per_km,
+    acceleration_avg_hr: x.running_phases?.acceleration?.avg_hr,
+    remainder_distance_m: x.running_phases?.remainder?.distance_m,
   }));
   const runColumns = Object.keys(runRows[0] || { activity_id: '', date: '', device: '' });
   atomicWrite(paths.runningCsv, toCsv(runRows, runColumns));
@@ -493,12 +519,14 @@ export function rebuild(paths, { strict = false } = {}) {
   const splitColumns = Object.keys(splitRows[0] || { activity_id: '', lap_index: '', distance_m: '' });
   atomicWrite(paths.splitsCsv, toCsv(splitRows, splitColumns));
   atomicWrite(paths.baselines, stableJson(buildBaselines(normalized)));
-  const result = { parsed: normalized.length, running: runs.length, invalid_count: invalid.length, invalid };
+  const result = { parsed: normalized.length, running: runs.length, invalid_count: invalid.length, invalid, reused, recomputed: normalized.length - reused };
   const priorState = readJson(paths.state, {});
   atomicWrite(paths.state, stableJson({
     ...priorState,
     schema_version: SCHEMA_VERSION,
     algorithm_version: ALGORITHM_VERSION,
+    annotations_hash: annotationsHash(paths),
+    derived_hashes: derivedHashes(paths),
     data_through: normalized.map((x) => x.date).filter(Boolean).sort().at(-1) || priorState.data_through || null,
     activity_ids: metadata.map((x) => { try { return activityId(x); } catch { return null; } }).filter(Boolean),
     valid_fit_ids: normalized.map((x) => x.activity_id),
@@ -508,7 +536,7 @@ export function rebuild(paths, { strict = false } = {}) {
   }));
   if (strict && invalid.length) throw new Error(`${invalid.length} missing or invalid FIT files`);
   const wp = wellnessPaths(paths);
-  if (existsSync(wp.raw)) result.wellness = rebuildWellness(paths);
+  if (wellness && existsSync(wp.raw)) result.wellness = rebuildWellness(paths);
   return result;
 }
 
@@ -517,17 +545,46 @@ function loadDerived(paths) {
   return readFileSync(paths.activitiesJsonl, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 }
 
+function annotationsHash(paths) {
+  return createHash('sha256').update(JSON.stringify(readAnnotations(paths))).digest('hex');
+}
+
+function readAnnotations(paths) {
+  if (!existsSync(paths.annotations)) return {};
+  try {
+    const value = JSON.parse(readFileSync(paths.annotations, 'utf8'));
+    if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error();
+    return value;
+  } catch { throw new Error('invalid annotations JSON; refusing to overwrite or ignore user labels'); }
+}
+
+function derivedHashes(paths) {
+  return Object.fromEntries(['activitiesJsonl', 'runningCsv', 'splitsCsv', 'baselines'].map(key => [key, existsSync(paths[key]) ? createHash('sha256').update(readFileSync(paths[key])).digest('hex') : null]));
+}
+
+function assertCurrentDerived(paths, rows) {
+  if (!rows.length) return;
+  const state = readJson(paths.state, {});
+  const loadedHash = createHash('sha256').update(rows.map(x => JSON.stringify(x)).join('\n') + '\n').digest('hex');
+  if (rows.some(x => x.schema_version !== SCHEMA_VERSION || x.algorithm_version !== ALGORITHM_VERSION || (x.is_running && x.running_phases?.version !== PHASE_VERSION)) || state.annotations_hash !== annotationsHash(paths)
+      || state.derived_hashes?.activitiesJsonl !== loadedHash
+      || JSON.stringify(state.derived_hashes) !== JSON.stringify(derivedHashes(paths))) {
+    throw new Error('running cache is stale; run coros-health.mjs rebuild offline before analysis');
+  }
+}
+
 function percent(target, baseline) {
   return Number.isFinite(target) && Number.isFinite(baseline) && baseline !== 0 ? ((target - baseline) / baseline) * 100 : null;
 }
 
 function compareMetric(target, groupStats, metric, targetValue) {
   const base = groupStats?.[metric];
-  return { value: targetValue, baseline_mean: base?.mean ?? null, baseline_median: base?.median ?? null, vs_mean_pct: percent(targetValue, base?.mean), vs_median_pct: percent(targetValue, base?.median) };
+  return { value: targetValue ?? null, count: base?.count ?? 0, baseline_mean: base?.mean ?? null, baseline_median: base?.median ?? null, vs_mean_pct: percent(targetValue, base?.mean), vs_median_pct: percent(targetValue, base?.median) };
 }
 
 export function compareLatest(paths) {
   const all = loadDerived(paths);
+  assertCurrentDerived(paths, all);
   const runs = all.filter((x) => x.is_running).sort((a, b) => (a.start_time || a.date || '').localeCompare(b.start_time || b.date || ''));
   const target = runs.at(-1);
   if (!target) return { ok: false, reason: 'no cached running activities', data_through: null };
@@ -535,19 +592,21 @@ export function compareLatest(paths) {
   const prior = runs.slice(0, -1);
   const recent = prior.filter((x) => targetTime - new Date(`${x.date}T00:00:00Z`).valueOf() <= 60 * 86400000);
   const sameDevice = prior.filter((x) => x.device && x.device === target.device);
-  const userFinish = prior.filter((x) => x.finish_1k?.classification === 'user');
-  const inferredFinish = prior.filter((x) => x.finish_1k?.classification === 'inferred');
-  const groups = { recent_60d: recent, same_device: sameDevice, finish_user: userFinish, finish_inferred: inferredFinish };
+  const userFinish = prior.filter((x) => x.running_phases?.acceleration && x.running_phases.classification === 'user');
+  const inferredFinish = prior.filter((x) => x.running_phases?.acceleration && x.running_phases.classification === 'inferred');
+  const sameCruiseDistance = prior.filter(x => x.running_phases?.cruise && target.running_phases?.cruise && Math.abs(x.running_phases.cruise.distance_m - target.running_phases.cruise.distance_m) <= 100);
+  const groups = { recent_60d: recent, same_device: sameDevice, recent_same_device: recent.filter(x => x.device && x.device === target.device), same_cruise_distance: sameCruiseDistance, finish_user: userFinish, finish_inferred: inferredFinish };
   const comparisons = {};
   for (const [name, rows] of Object.entries(groups)) {
     const s = stats(rows);
     comparisons[name] = {
       count: rows.length,
-      steady_pace: compareMetric(target, s, 'pace_s_per_km', target.steady_5k?.pace_s_per_km),
-      steady_hr: compareMetric(target, s, 'avg_hr', target.steady_5k?.avg_hr),
-      steady_ef: compareMetric(target, s, 'ef', target.steady_5k?.ef),
-      finish_pace: compareMetric(target, s, 'finish_pace_s_per_km', target.finish_1k?.pace_s_per_km),
-      finish_hr: compareMetric(target, s, 'finish_avg_hr', target.finish_1k?.avg_hr),
+      phases: compareRunningPhases(target.running_phases, rows.map(x => x.running_phases)),
+      steady_pace: compareMetric(target, s, 'pace_s_per_km', target.running_phases?.cruise?.pace_s_per_km),
+      steady_hr: compareMetric(target, s, 'avg_hr', target.running_phases?.cruise?.avg_hr),
+      steady_ef: compareMetric(target, s, 'ef', target.running_phases?.cruise?.ef),
+      finish_pace: compareMetric(target, s, 'finish_pace_s_per_km', target.running_phases?.acceleration?.pace_s_per_km),
+      finish_hr: compareMetric(target, s, 'finish_avg_hr', target.running_phases?.acceleration?.avg_hr),
     };
   }
   const deviceGroups = {};
@@ -652,7 +711,7 @@ export async function sync(paths, options = {}) {
   }
   const versionsCurrent = previousState.schema_version === SCHEMA_VERSION && previousState.algorithm_version === ALGORITHM_VERSION;
   const derivedPresent = [paths.activitiesJsonl, paths.runningCsv, paths.splitsCsv, paths.baselines].every(existsSync);
-  const needsRebuild = result.metadata_changed || result.fit_downloaded > 0 || !versionsCurrent || !derivedPresent;
+  const needsRebuild = result.metadata_changed || result.fit_downloaded > 0 || !versionsCurrent || !derivedPresent || previousState.annotations_hash !== annotationsHash(paths);
   const rebuilt = needsRebuild ? rebuild(paths) : {
     skipped: true,
     reason: 'no metadata/FIT/algorithm changes',
@@ -664,7 +723,9 @@ export async function sync(paths, options = {}) {
     ? loadDerived(paths).map((x) => x.activity_id)
     : previousState.valid_fit_ids || loadDerived(paths).map((x) => x.activity_id);
   const state = {
+    ...readJson(paths.state, {}),
     schema_version: SCHEMA_VERSION, algorithm_version: ALGORITHM_VERSION,
+    annotations_hash: annotationsHash(paths),
     last_attempt_at: new Date().toISOString(), last_success_at: result.remote.status === 'ok' ? new Date().toISOString() : previousState.last_success_at || null,
     last_rebuild_at: needsRebuild ? new Date().toISOString() : previousState.last_rebuild_at || null,
     data_through: result.data_through, activity_ids: merged.map((x) => activityId(x)),
@@ -753,11 +814,17 @@ async function main(argv = process.argv.slice(2)) {
   }));
   else if (command === 'wellness-rebuild') output(rebuildWellness(paths));
   else if (command === 'wellness-trend') output(wellnessTrend(paths, { days: args.days }));
-  else if (command === 'rebuild') output(rebuild(paths));
+  else if (command === 'rebuild') output(rebuild(paths, { strict: true, wellness: !args['fit-only'] }));
   else if (command === 'validate') output(validate(paths));
   else if (command === 'compare') output(compareLatest(paths));
+  else if (command === 'annotate-phase') output(annotatePhase(paths, args['activity-id'], {
+    cruise_end_lap: args['cruise-end-lap'] === undefined ? undefined : Number(args['cruise-end-lap']),
+    status: args.status,
+  }));
   else if (command === 'analyze-latest') {
-    const data = loadDerived(paths).sort((a, b) => (a.start_time || a.date || '').localeCompare(b.start_time || b.date || ''));
+    const data = loadDerived(paths);
+    assertCurrentDerived(paths, data);
+    data.sort((a, b) => (a.start_time || a.date || '').localeCompare(b.start_time || b.date || ''));
     output({ ok: Boolean(data.length), data_through: data.at(-1)?.date || null, activity: data.at(-1) || null });
   } else if (command === 'migrate') {
     const legacy = args['legacy-dir'] || join(paths.workspace, 'tools', 'coros-data');
@@ -779,4 +846,35 @@ function isDirectExecution(entrypoint = process.argv[1]) {
 }
 
 const isMain = isDirectExecution();
-if (isMain) main().catch((error) => { process.stderr.write(`coros-health: ${error.message}\n`); process.exitCode = 1; });
+if (isMain) runCli().catch((error) => { process.stderr.write(`coros-health: ${error.message}\n`); process.exitCode = 1; });
+
+async function runCli() {
+  const args = parseArgs(process.argv.slice(2));
+  if (!['sync', 'sync-fit', 'rebuild', 'migrate', 'annotate-phase'].includes(args._[0])) return main();
+  const paths = resolvePaths({ workspace: args.workspace, dataRoot: args['data-root'] });
+  mkdirSync(join(paths.root, 'state'), { recursive: true });
+  const lock = join(paths.root, 'state', 'activity-write.lock');
+  let fd;
+  try { fd = openSync(lock, 'wx', 0o600); }
+  catch { throw new Error('activity writer lock exists; retry after the other writer finishes; do not remove a live lock'); }
+  try { writeFileSync(fd, JSON.stringify({ pid: process.pid })); return await main(); }
+  finally { closeSync(fd); unlinkSync(lock); }
+}
+
+export function annotatePhase(paths, id, phase) {
+  const rows = loadDerived(paths);
+  const row = rows.find(x => x.activity_id === id && x.is_running);
+  if (!row) throw new Error('unknown cached running activity');
+  const boundary = phase.cruise_end_lap;
+  if (boundary !== undefined ? phase.status !== undefined || !Number.isInteger(boundary) || boundary < 1 || boundary >= row.laps.length : !['steady_only', 'unknown'].includes(phase.status)) throw new Error('specify a valid cruise-end-lap OR status steady_only/unknown');
+  const annotations = readAnnotations(paths);
+  const prior = annotations[id];
+  const clean = boundary === undefined ? { status: phase.status } : { cruise_end_lap: boundary };
+  if (boundary !== undefined && detectActivityPhases(row.laps, [], {}, clean).classification !== 'user') throw new Error('boundary does not leave an acceleration phase before the remainder');
+  const current = typeof prior === 'object' && prior ? prior : prior ? { finish_1k: prior } : {};
+  if (JSON.stringify(current.running_phases) === JSON.stringify(clean)) return { ok: true, unchanged: true };
+  const history = [...(current.phase_history || []), { at: new Date().toISOString(), previous: current.running_phases || null, next: clean }];
+  annotations[id] = { ...current, running_phases: clean, phase_history: history };
+  atomicWrite(paths.annotations, stableJson(annotations));
+  return { ok: true, rebuild: rebuild(paths, { strict: true, wellness: false }) };
+}

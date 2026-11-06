@@ -1,5 +1,5 @@
-// Experimental, pure/offline phase detector. Not wired into production caches.
-export const PHASE_VERSION = 'prototype-1';
+// Deterministic, offline running-phase detector. Never equate inference with intent.
+export const PHASE_VERSION = '1';
 const valid = x => Number.isFinite(x) && x > 0;
 const sum = xs => xs.reduce((a, b) => a + b, 0);
 const median = xs => { const a = [...xs].sort((a, b) => a - b); return a.length % 2 ? a[a.length >> 1] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2; };
@@ -17,6 +17,8 @@ export function phaseMetrics(laps) {
     ef: hr ? distance * 60 / seconds / hr : null,
     avg_cadence_spm: weighted('avg_cadence_spm'), avg_power_w: weighted('avg_power_w'),
     max_hr: laps.every(x => valid(x.max_hr)) ? Math.max(...laps.map(x => x.max_hr)) : null,
+    max_speed_mps: laps.every(x => valid(x.max_speed_mps)) ? Math.max(...laps.map(x => x.max_speed_mps)) : null,
+    avg_temperature_c: laps.every(x => Number.isFinite(x.avg_temperature_c)) ? sum(laps.map(x => x.avg_temperature_c * time(x))) / seconds : null,
     hr_coverage: sum(laps.filter(x => valid(x.avg_hr)).map(time)) / seconds,
   };
 }
@@ -36,6 +38,8 @@ export function detectRunningPhases(laps, annotation = null) {
   }
   const total = phaseMetrics(body);
   if (!total) { result.reasons.push('no_analyzable_body'); return result; }
+  if (annotation?.status === 'unknown') return { ...result, classification: 'user', reasons: ['user_excluded'] };
+  if (annotation?.status === 'steady_only') return { ...result, status: 'steady_only', classification: 'user', confidence: 'confirmed', cruise: total, reasons: ['user_confirmed_steady'] };
   if (annotation?.cruise_end_lap !== undefined) {
     const k = body.findIndex(x => x.lap_index === annotation.cruise_end_lap) + 1;
     if (k < 1 || k >= body.length) { result.reasons.push('invalid_annotation'); return result; }
@@ -96,4 +100,57 @@ export function compareRunningPhases(target, history) {
     }
   }
   return out;
+}
+
+// Record fallback for boundaries hidden by auto-lap averages. Do not bridge
+// pauses, missing timestamps or distance jumps; those require review instead.
+export function recordPhaseBins(records, session = {}) {
+  if (!Array.isArray(records) || records.length < 2) return null;
+  if (!valid(session.totalTimerTime) || !valid(session.totalDistance) || !valid(session.totalElapsedTime)
+      || Math.abs(session.totalElapsedTime - session.totalTimerTime) > 10) return null;
+  const bins = []; let intervals = [], start = 0, distance = 0;
+  const flush = () => {
+    if (!intervals.length) return;
+    const m = phaseMetrics(intervals);
+    bins.push({ ...m, lap_index: bins.length + 1, timer_time_s: m.effective_time_s,
+      elapsed_time_s: m.effective_time_s, total_descent_m: intervals.every(x => Number.isFinite(x.total_descent_m)) ? sum(intervals.map(x => x.total_descent_m)) : null,
+      start_distance_m: start, end_distance_m: start + m.distance_m });
+    start += m.distance_m; distance = 0; intervals = [];
+  };
+  for (let i = 1; i < records.length; i++) {
+    const a = records[i - 1], b = records[i];
+    if (!Number.isFinite(a.distance) || !Number.isFinite(b.distance)) return null;
+    const dt = (new Date(b.timestamp) - new Date(a.timestamp)) / 1000;
+    const dd = b.distance - a.distance;
+    if (!valid(dt) || dt > 15 || !valid(dd) || dd > 100 || dd / dt > 10) return null;
+    const altA = a.enhancedAltitude ?? a.altitude, altB = b.enhancedAltitude ?? b.altitude;
+    const cadence = b.cadence;
+    intervals.push({ distance_m: dd, timer_time_s: dt, avg_hr: b.heartRate,
+      avg_cadence_spm: valid(cadence) ? cadence < 130 ? cadence * 2 : cadence : null,
+      avg_power_w: b.power, max_hr: b.heartRate, max_speed_mps: dd / dt,
+      avg_temperature_c: b.temperature,
+      total_descent_m: Number.isFinite(altA) && Number.isFinite(altB) ? Math.max(0, altA - altB) : null });
+    distance += dd;
+    if (distance >= 500) flush();
+  }
+  flush();
+  const total = phaseMetrics(bins);
+  if (!total || Math.abs(total.distance_m / session.totalDistance - 1) > 0.02
+      || Math.abs(total.effective_time_s / session.totalTimerTime - 1) > 0.02) return null;
+  return bins;
+}
+
+export function detectActivityPhases(laps, records, session, annotation) {
+  const result = detectRunningPhases(laps, annotation);
+  if (annotation || result.reasons.some(x => ['pause_confounded', 'downhill_confounded', 'invalid_or_noncontiguous_laps'].includes(x))) return result;
+  const bins = recordPhaseBins(records, session);
+  if (!bins) return { ...result, warnings: [...result.warnings, 'record_refinement_unavailable'] };
+  const refined = detectRunningPhases(bins);
+  if (refined.status !== 'cruise_acceleration') return result;
+  for (const phase of [refined.cruise, refined.acceleration, refined.remainder, ...refined.candidates.flatMap(x => [x.cruise, x.acceleration])]) {
+    if (phase?.lap_indices) { phase.bin_indices = phase.lap_indices; delete phase.lap_indices; }
+  }
+  for (const c of refined.candidates) { c.cruise_end_bin = c.cruise_end_lap; delete c.cruise_end_lap; }
+  return { ...refined, resolution: 'record_bins_approximately_500m', boundary_distance_m: refined.cruise.distance_m,
+    warnings: [...refined.warnings, 'record_boundary_is_approximate'] };
 }

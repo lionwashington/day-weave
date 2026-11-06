@@ -49,7 +49,8 @@ than repeatedly retrying. Never delete credentials to resolve a network error.
 - For HRV, sleep, resting-HR, stress, recovery or training-load questions, run `wellness-sync`, then `wellness-trend`. If the remote call fails, use the local trend and state its `data_through` watermark.
 - For ordinary comparisons, run `compare` directly. It reads persistent derived data without networking.
 - For the latest cached activity, run `analyze-latest`.
-- After an algorithm/schema upgrade, run `rebuild` to regenerate all derived files from valid cached FIT files.
+- After an algorithm/schema upgrade or a stale-cache error, run `rebuild --fit-only` offline before running analysis. It reuses unchanged activity inputs and regenerates running outputs without touching wellness or downloading FIT.
+- When the user corrects a phase boundary, run `annotate-phase --activity-id ID --cruise-end-lap N`; or `--status steady_only` / `--status unknown`. Do not create confirmed annotations from an agent's guess. This records the correction and rebuilds affected derived metrics.
 - To audit cached files and state, run `validate`.
 - During legacy migration, run `migrate --legacy-dir <path>` once, followed by `sync --repair` if credentials are available.
 - For first-time official access, run `oauth-start`, have the owner open the returned COROS URL, then run `oauth-finish`. Never use the helper's legacy username/password login.
@@ -94,17 +95,18 @@ the historical `latest` row. `last_remote_status=failed` must also be disclosed.
 
 ## Interpret results
 
-- Use only the first five complete 1 km laps for `steady_5k`.
-- Use only the sixth complete 1 km lap for `finish_1k`; never mix it into the steady baseline.
+- Use `running_phases.cruise` and `.acceleration`, not fixed kilometre positions. Either phase may span multiple kilometres. Keep `.remainder` separate.
+- `unknown` means no authoritative phase assignment; explain the reasons and request confirmation if needed. `steady_only` means no detected finishing acceleration, not proof of the runner's intent.
+- `legacy_fixed_segments` preserves the old first-five/sixth-lap calculation only for compatibility. Never use it as the actual training phases or to replace missing phase data.
 - Treat `timer_time_s` as primary and `elapsed_time_s` only as fallback.
-- Define EF as speed in metres/minute divided by time-weighted average heart rate. For the steady segment: `(5000 / timer_seconds * 60) / weighted_avg_hr`.
-- Treat `finish_classification: user` as explicitly annotated and `inferred` as a transparent heuristic, not a fact. Never call every sixth lap a爽跑.
+- EF = `(phase_distance_m / phase_effective_time_s * 60) / time_weighted_hr`. Incomplete HR coverage yields null HR/EF, not a guessed value.
+- Compare the entire cruise phase with historical cruise phases, and the entire acceleration phase with historical acceleration phases. Preserve distance and time alongside pace/HR/EF, per-metric sample counts, and user/inferred cohorts. Different phase lengths are not equivalent tests of fitness.
+- `classification: user` is an explicit correction; `inferred` remains a heuristic. Read confidence, reasons, warnings and resolution. Record-bin boundaries are approximate; lap-only boundaries cannot locate a transition inside a lap.
 - Keep device and temperature visible as explanatory variables. Do not claim an absolute fitness gain from cross-device or cross-temperature differences.
 - Prefer comparisons with a non-zero sample count and state the sample size.
 - Treat HRV as an individual trend, not a cross-person score. Associate daily wellness rows with cached activity training load by date, but describe association rather than causation.
 
 Read [references/schema.md](references/schema.md) when changing the data format, metric definitions, or annotation behavior.
 
-Development only: [adaptive phase design](references/running-phases-design.md)
-describes a sandbox prototype. It is not yet used by the commands above; do not
-present existing fixed-distance outputs as automatically detected phases.
+Read [running-phase rules](references/running-phases-design.md) for detection thresholds,
+record coverage requirements, annotation semantics and cache migration.

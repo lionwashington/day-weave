@@ -104,7 +104,10 @@ test('rebuild is deterministic and compare groups PACE 2/PACE 4', () => {
   const hashes = [paths.activitiesJsonl, paths.runningCsv, paths.splitsCsv].map((p) => createHash('sha256').update(readFileSync(p)).digest('hex'));
   const second = rebuild(paths);
   const hashes2 = [paths.activitiesJsonl, paths.runningCsv, paths.splitsCsv].map((p) => createHash('sha256').update(readFileSync(p)).digest('hex'));
-  assert.deepEqual(first, second);
+  assert.equal(first.parsed, second.parsed);
+  assert.equal(second.reused, 3);
+  assert.equal(second.recomputed, 0);
+  assert.equal(second.skipped, true);
   assert.deepEqual(hashes, hashes2);
   const comparison = compareLatest(paths);
   assert.equal(comparison.ok, true);
