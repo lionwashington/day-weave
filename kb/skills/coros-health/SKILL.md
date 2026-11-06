@@ -104,3 +104,7 @@ the historical `latest` row. `last_remote_status=failed` must also be disclosed.
 - Treat HRV as an individual trend, not a cross-person score. Associate daily wellness rows with cached activity training load by date, but describe association rather than causation.
 
 Read [references/schema.md](references/schema.md) when changing the data format, metric definitions, or annotation behavior.
+
+Development only: [adaptive phase design](references/running-phases-design.md)
+describes a sandbox prototype. It is not yet used by the commands above; do not
+present existing fixed-distance outputs as automatically detected phases.
