@@ -17,7 +17,6 @@ export interface CodexChannelTargetOptions {
   externalChatId: string
   externalThreadId?: string
   cwd: string
-  model?: string
   canonicalThreadId?: string
   canonicalThreadPath?: string
   allowUnpersistedThread?: boolean
@@ -130,13 +129,9 @@ export class CodexChannelTarget implements RuntimeTarget {
 
   private observedModel?: string
 
-  configureModel(model?: string): void {
-    if (this.options.model !== model) this.observedModel = undefined
-    this.options.model = model
-  }
-
-  modelStatus(): { configured_model?: string; observed_model?: string } {
-    return { configured_model: this.options.model, observed_model: this.observedModel }
+  // Last model reported by App Server at start/resume; telemetry, never an override.
+  modelStatus(): { observed_model?: string } {
+    return { observed_model: this.observedModel }
   }
 
   private observeModel(response: any): void {
@@ -176,7 +171,6 @@ export class CodexChannelTarget implements RuntimeTarget {
     if (this.binding && !this.options.allowUnpersistedThread) {
       const resumed = await this.options.client.request('thread/resume', {
         threadId: this.binding.runtimeSessionId,
-        ...(this.options.model ? { model: this.options.model } : {}),
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
       }, this.options.threadResumeTimeoutMs ?? 10 * 60_000)
@@ -198,7 +192,6 @@ export class CodexChannelTarget implements RuntimeTarget {
     if (!this.options.allowUnpersistedThread || !this.binding) return
     const resumed = await this.options.client.request('thread/resume', {
       threadId: this.binding.runtimeSessionId,
-      ...(this.options.model ? { model: this.options.model } : {}),
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
     }, this.options.threadResumeTimeoutMs ?? 10 * 60_000)
@@ -257,7 +250,6 @@ export class CodexChannelTarget implements RuntimeTarget {
     if (this.binding) return this.binding
     const started = await this.options.client.request('thread/start', {
       cwd: this.options.cwd,
-      ...(this.options.model ? { model: this.options.model } : {}),
       ephemeral: false,
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
@@ -389,7 +381,6 @@ export class CodexChannelTarget implements RuntimeTarget {
       void completed.catch(() => {})
       const started = await this.options.client.request('turn/start', {
         threadId: binding.runtimeSessionId,
-        ...(this.options.model ? { model: this.options.model } : {}),
         input: buildCodexTurnInput(source),
         approvalPolicy: 'never',
         sandboxPolicy: DANGER_FULL_ACCESS,
@@ -467,12 +458,12 @@ export class CodexChannelTarget implements RuntimeTarget {
       if (this.shuttingDown) throw new Error('Codex target is shutting down')
       try {
         await this.options.client.reconnect()
-        await this.options.client.request('thread/resume', {
+        const resumed = await this.options.client.request('thread/resume', {
           threadId: binding.runtimeSessionId,
-          ...(this.options.model ? { model: this.options.model } : {}),
           approvalPolicy: 'never',
           sandbox: 'danger-full-access',
         }, this.options.threadResumeTimeoutMs ?? 10 * 60_000)
+        this.observeModel(resumed)
         this.connected = true
         const read = await this.options.client.request('thread/read', {
           threadId: binding.runtimeSessionId,

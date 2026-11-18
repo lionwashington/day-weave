@@ -14,7 +14,6 @@ import { createHash } from 'node:crypto'
 export interface CodexRuntimeRegistration {
   name: string
   cwd: string
-  model?: string
   endpoint?: string
   socketPath?: string
   threadId?: string
@@ -142,7 +141,6 @@ export class CodexRuntimeManager {
     // in one retry and present in the next; replacing the client for that change
     // closes an otherwise healthy WebSocket and aborts an active channel turn.
     if (current && sameRuntimeIdentity(current.registration, item)) {
-      current.target.configureModel(item.model ?? current.registration.model)
       if (current.registration.allowUnpersistedThread && !item.allowUnpersistedThread) {
         this.connectingClients.set(item.name, current.client)
         try {
@@ -166,7 +164,6 @@ export class CodexRuntimeManager {
     const target = new CodexChannelTarget({
       name: item.name,
       cwd: item.cwd,
-      model: item.model,
       canonicalThreadId: item.threadId,
       canonicalThreadPath: item.threadPath,
       allowUnpersistedThread: item.allowUnpersistedThread,
@@ -227,7 +224,7 @@ export class CodexRuntimeManager {
     this.streams.clear()
   }
 
-  registrations(): Array<{ name: string; alive: boolean; configured_model?: string; observed_model?: string }> {
+  registrations(): Array<{ name: string; alive: boolean; observed_model?: string }> {
     return Array.from(this.targets, ([name, managed]) => ({ name, alive: managed.target.isAlive(), ...managed.target.modelStatus() }))
   }
 

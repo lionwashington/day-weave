@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,7 +20,8 @@ async function registerFake(daemon: { baseUrl: string }, workspace: string, name
   })
   assert.equal(response.ok, true, await response.text())
   const status = await fetch(`${daemon.baseUrl}/api/status`).then(response => response.json())
-  assert.equal(status.runtime_targets.find((target: any) => target.name === name).configured_model, 'synthetic-codex')
+  assert.equal(status.runtime_targets.find((target: any) => target.name === name).configured_model, undefined)
+  assert.equal(status.runtime_targets.find((target: any) => target.name === name).observed_model, 'fake')
   return server
 }
 
@@ -51,6 +52,10 @@ test('Lark routes a configured group through the shared Codex runtime bridge', a
     })])
     assert.equal(await waitFor(() => daemon.apiCalls().includes('/settings'), 5_000), true)
     const calls = daemon.apiCalls()
+    const turns = JSON.parse(readFileSync(join(workspace, 'fake-state.json'), 'utf8')).requests.filter((r: any) => r.method === 'turn/start')
+    assert.equal(turns.length, 1)
+    assert.equal(turns[0].params.threadId, 'thread-1')
+    assert.equal(Object.hasOwn(turns[0].params, 'model'), false)
     assert.match(calls, /POST\t\/open-apis\/cardkit\/v1\/cards/)
     assert.match(calls, /POST\t\/open-apis\/im\/v1\/messages/)
     assert.match(calls, /PUT\t\/open-apis\/cardkit\/v1\/cards\/card-1\/elements\/content\/content/)

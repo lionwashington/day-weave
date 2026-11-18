@@ -50,27 +50,26 @@ test('maps downloaded platform images to Codex localImage input', () => {
   }), [{ type: 'text', text: '[attachment: notes.pdf]\n\nLocal attachment path: /tmp/notes.pdf', text_elements: [] }])
 })
 
-test('applies configured model on creation, resume and subsequent channel turns', async () => {
+test('channel never overrides Codex session settings on create, resume or turn', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ka-model-lifecycle-'))
   const statePath = join(dir, 'fake-state.json')
   const appServer = client(statePath)
-  const options = { name: 'model-test', platform: 'telegram' as const, externalChatId: 'test-chat', cwd: dir,
-    model: 'synthetic-model-a', client: appServer, bindings: new BindingStore(join(dir, 'bindings.json')), onEvent: () => {} }
-  const first = new CodexChannelTarget(options)
   try {
+    const first = target(dir, appServer, [])
     await first.deliver({ content: 'first', meta: {} })
     first.shutdown()
-    const resumed = new CodexChannelTarget({ ...options, model: 'synthetic-model-b' })
+    const resumed = target(dir, appServer, [])
     await resumed.connect()
     await resumed.deliver({ content: 'second', meta: {} })
-    resumed.configureModel('synthetic-model-c')
-    await resumed.deliver({ content: 'third', meta: {} })
     resumed.shutdown()
     const requests = JSON.parse(readFileSync(statePath, 'utf8')).requests
-    assert.equal(requests.find((r: any) => r.method === 'thread/start').params.model, 'synthetic-model-a')
-    assert.equal(requests.find((r: any) => r.method === 'thread/resume').params.model, 'synthetic-model-b')
-    assert.deepEqual(requests.filter((r: any) => r.method === 'turn/start').map((r: any) => r.params.model),
-      ['synthetic-model-a', 'synthetic-model-b', 'synthetic-model-c'])
+    const lifecycle = requests.filter((r: any) => ['thread/start', 'thread/resume', 'turn/start'].includes(r.method))
+    assert.deepEqual(lifecycle.map((r: any) => r.method), ['thread/start','turn/start','thread/resume','turn/start'])
+    for (const r of lifecycle) {
+      assert.equal(Object.hasOwn(r.params, 'model'), false, r.method)
+      assert.equal(Object.hasOwn(r.params, 'effort'), false, r.method)
+    }
+    assert.equal(lifecycle[1].params.threadId, lifecycle[3].params.threadId)
   } finally { await appServer.stop() }
 })
 

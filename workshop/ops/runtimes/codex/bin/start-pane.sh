@@ -132,19 +132,19 @@ CODEX_MCP_OVERRIDES=(
     -c 'mcp_servers.telegram.enabled=false'
     -c "mcp_servers.${CHANNEL_MCP_SERVER}.url=\"${CHANNEL_MCP_URL}\""
 )
-# Resolve the explicit mate model before starting the sidecar and registrar.
-export KA_CODEX_MODEL=""
+# Resolve the explicit mate model as the sidecar startup default (never a Channel turn override).
+startup_model=""
 MODEL_NEXT=0
 for arg in "$@"; do
-    if [ "$MODEL_NEXT" = 1 ]; then KA_CODEX_MODEL="$arg"; MODEL_NEXT=0; continue; fi
+    if [ "$MODEL_NEXT" = 1 ]; then startup_model="$arg"; MODEL_NEXT=0; continue; fi
     case "$arg" in
         --model|-m) MODEL_NEXT=1 ;;
-        --model=*|-m=*) KA_CODEX_MODEL="${arg#*=}" ;;
+        --model=*|-m=*) startup_model="${arg#*=}" ;;
     esac
 done
 [ "$MODEL_NEXT" = 0 ] || { echo 'missing --model value' >&2; exit 2; }
-if [ -n "$KA_CODEX_MODEL" ]; then
-    CODEX_MCP_OVERRIDES+=(-c "model=$(node -e 'process.stdout.write(JSON.stringify(process.env.KA_CODEX_MODEL))')")
+if [ -n "$startup_model" ]; then
+    CODEX_MCP_OVERRIDES+=(-c "model=$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$startup_model")")
 fi
 # Remote resume may ignore the TUI hook-bypass flag. Implement the launcher's
 # existing invocation-only bypass intent using exact hashes reported by Codex.
@@ -307,7 +307,7 @@ register_loop() {
             fi
         fi
         body="$(PANE_NAME="$SAFE_NAME" PANE_CWD="$EXPECTED_CWD" APP_SERVER_ENDPOINT="$APP_SERVER_ENDPOINT" THREAD_ID="$canonical_thread_id" THREAD_PATH="$thread_path" ALLOW_UNPERSISTED_THREAD="$allow_unpersisted" node -e \
-            'process.stdout.write(JSON.stringify({name:process.env.PANE_NAME,cwd:process.env.PANE_CWD,endpoint:process.env.APP_SERVER_ENDPOINT,thread_id:process.env.THREAD_ID,thread_path:process.env.THREAD_PATH||undefined,model:process.env.KA_CODEX_MODEL||undefined,allow_unpersisted_thread:process.env.ALLOW_UNPERSISTED_THREAD==="1"}))')"
+            'process.stdout.write(JSON.stringify({name:process.env.PANE_NAME,cwd:process.env.PANE_CWD,endpoint:process.env.APP_SERVER_ENDPOINT,thread_id:process.env.THREAD_ID,thread_path:process.env.THREAD_PATH||undefined,allow_unpersisted_thread:process.env.ALLOW_UNPERSISTED_THREAD==="1"}))')"
         status="$(curl -sf --max-time 1 "http://127.0.0.1:$port/api/status" 2>/dev/null || true)"
         if [ "$last_registered_allow" != "$allow_unpersisted" ] || ! printf '%s' "$status" | PANE_NAME="$SAFE_NAME" node -e \
             'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{const j=JSON.parse(s);process.exit(j.runtime_targets?.some(x=>x.name===process.env.PANE_NAME)?0:1)}catch{process.exit(1)}})' \

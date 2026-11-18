@@ -157,7 +157,6 @@ export function createHttpApp(platform: Platform, runtimeManager?: CodexRuntimeM
         name,
         runtime: target.runtime,
         alive: target.isAlive?.() ?? true,
-        ...(modelByName.get(name)?.configured_model ? { configured_model: modelByName.get(name)!.configured_model } : {}),
         ...(modelByName.get(name)?.observed_model ? { observed_model: modelByName.get(name)!.observed_model } : {}),
       })),
       dispatches_total: counters.dispatches,
@@ -202,14 +201,14 @@ export function createHttpApp(platform: Platform, runtimeManager?: CodexRuntimeM
     const endpoint = String(req.body?.endpoint ?? '')
     const threadId = String(req.body?.thread_id ?? '')
     const threadPath = String(req.body?.thread_path ?? '')
-    const model = String(req.body?.model ?? '') || undefined
+    // Older Workshop registrars may send `model`. Ignore it: Codex owns session settings.
     const allowUnpersistedThread = req.body?.allow_unpersisted_thread === true
     const validEndpoint = /^ws:\/\/127\.0\.0\.1:\d+$/.test(endpoint)
     if (!rawName || !cwd || !threadId || (!socketPath.startsWith('/') && !validEndpoint)) {
       res.status(400).json({ ok: false, error: 'name, cwd, thread_id, and a loopback endpoint or absolute socket_path are required' }); return
     }
     try {
-      await runtimeManager.register({ name, cwd, model, endpoint: validEndpoint ? endpoint : undefined, socketPath: socketPath || undefined, threadId, threadPath: threadPath || undefined, allowUnpersistedThread })
+      await runtimeManager.register({ name, cwd, endpoint: validEndpoint ? endpoint : undefined, socketPath: socketPath || undefined, threadId, threadPath: threadPath || undefined, allowUnpersistedThread })
       res.json({ ok: true, name })
     } catch (error: any) {
       log(`Codex runtime registration failed (${name}): ${error?.message ?? error}`)

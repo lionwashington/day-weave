@@ -13,7 +13,7 @@ production installation, restart, model change, or thread migration.
 | Area | Change | Compatibility |
 | --- | --- | --- |
 | Workshop models | Per-runtime `models.cc` / `models.codex`, overridden by mate `model`, then explicit CLI model arguments | No configured model retains existing defaults; Claude and Codex have separate defaults |
-| Codex bridge | Model travels through sidecar configuration, registration, thread creation/resume and channel turns | Status distinguishes configured model from a model actually returned by the server; missing observed model means unknown |
+| Codex bridge | Workshop sets the startup default. Channel routes to the thread without overriding its model on creation, resume or delivery; legacy registration model fields are ignored | `observed_model` is the model last reported during thread creation/resume, not proof of the model used for the latest turn |
 | Thread selection | Explicit thread, then persisted mate owner, then existing cwd fallback | Saved thread cwd is checked before resume; a mismatch fails closed |
 | FTS5 | Versioned SHA-256 fingerprints identify changed sources independently of timestamp ordering | Legacy databases refresh once; unchanged text does not rebuild rows or embed |
 | Codex capture | Identical content is not rewritten; continuation resets distilled state and preserves the processed prefix length | Full browse still reads all messages; only unprocessed enumeration omits the processed prefix |

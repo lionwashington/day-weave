@@ -72,7 +72,7 @@ globalThis.WebSocket = class extends EventTarget {
         assert.equal(requests.some(r => r.method === 'thread/read'), false)
       }
       for (const r of requests.filter(r => r.method === 'thread/resume')) {
-        assert.equal(r.params.model, 'synthetic-model')
+        assert.equal(Object.hasOwn(r.params, 'model'), false)
         assert.equal(r.params.threadId, scenario === 'bound' ? 'own-thread' : explicit ? 'explicit-thread' : 'latest-thread')
       }
       if (['fresh', 'wait', 'list-error', 'list-wrong-cwd', 'explicit-missing', 'explicit-timeout', 'explicit-wrong-cwd', 'explicit-unloaded-other-thread'].includes(scenario)) {

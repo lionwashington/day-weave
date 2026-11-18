@@ -40,7 +40,8 @@ test('Telegram routes an owner message through a persistent Codex target', async
     }, 5_000)
     assert.equal(online, true)
     const modelStatus = await fetch(`${daemon.baseUrl}/api/status`).then(response => response.json())
-    assert.equal(modelStatus.runtime_targets.find((target: any) => target.name === 'codex-main').configured_model, 'synthetic-codex')
+    assert.equal(modelStatus.runtime_targets.find((target: any) => target.name === 'codex-main').configured_model, undefined)
+    assert.equal(modelStatus.runtime_targets.find((target: any) => target.name === 'codex-main').observed_model, 'fake')
     await assert.rejects(connectClient(daemon.baseUrl, 'codex-main'), /409|conflict|already owned/i)
 
     const scheduled = await fetch(`${daemon.baseUrl}/api/runtimes/codex/codex-main/deliver`, {
@@ -59,6 +60,9 @@ test('Telegram routes an owner message through a persistent Codex target', async
     const log = (() => { try { return readFileSync(join(daemon.dataDir, 'channel.log'), 'utf8') } catch { return '' } })()
     assert.equal(replied, true, `sent=${JSON.stringify(telegram.sent())}\nlog=${log}`)
     assert.equal(telegram.sent().filter(message => message.text.includes('echo:hello')).length, 1)
+    const routed = JSON.parse(readFileSync(statePath, 'utf8')).requests.filter((r: any) => r.method === 'turn/start')
+    assert.equal(routed.length, 2) // scheduled and owner messages
+    assert.ok(routed.every((r: any) => r.params.threadId === 'thread-1' && !Object.hasOwn(r.params, 'model')))
     assert.ok(telegram.sent().some(message =>
       message.text === '**[#1-codex-main]**\n\necho:hello',
     ), `channel prefix must be a separate paragraph: ${JSON.stringify(telegram.sent())}`)
@@ -146,7 +150,17 @@ test('Telegram routes an owner message through a persistent Codex target', async
     assert.equal(approved, true, `sent=${JSON.stringify(telegram.sent())}\nlog=${approvalLog}`)
 
     push(6, 'to codex-main: wait-for-interrupt')
-    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(await waitFor(() => {
+      try {
+        const state = JSON.parse(readFileSync(statePath, 'utf8'))
+        const request = state.requests.filter((r: any) => r.method === 'turn/start').at(-1)
+        const turn = state.threads['thread-1'].turns.at(-1)
+        const { bindings } = JSON.parse(readFileSync(join(daemon.dataDir, 'bindings.json'), 'utf8'))
+        return request?.params.input.some((item: any) => item.text === 'wait-for-interrupt') &&
+          turn?.status === 'inProgress' && Object.values(bindings).some((b: any) =>
+            b.channelName === 'codex-main' && b.activeTurnId === turn.id)
+      } catch { return false } // the fake server may be persisting its next snapshot
+    }, 5_000), true, 'the interrupt fixture must have an active bound turn before /stop')
     push(7, 'to codex-main: /stop')
     assert.equal(await waitFor(() => telegram.sent().some(message => message.text.includes('Interrupt requested.')), 5_000), true)
   } finally {

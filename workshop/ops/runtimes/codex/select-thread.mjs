@@ -14,7 +14,6 @@ const websocket = new WebSocket(endpoint)
 let nextId = 1
 const pending = new Map()
 let notifiedThread
-const model = process.env.KA_CODEX_MODEL || undefined
 const resumeTimeoutMs = Number(process.env.KA_CODEX_THREAD_RESUME_TIMEOUT_MS ?? 600_000)
 
 function request(method, params, timeoutMs = 15_000) {
@@ -82,7 +81,7 @@ try {
       if (rpc?.code !== -32600 || rpc.message !== `thread not loaded: ${requestedThreadId}`) throw error
     }
     try {
-      const resumed = await request('thread/resume', { threadId: requestedThreadId, ...(model ? { model } : {}) }, resumeTimeoutMs)
+      const resumed = await request('thread/resume', { threadId: requestedThreadId }, resumeTimeoutMs)
       thread = resumed.thread
     } catch (error) {
       // An empty TUI thread has no rollout until its first turn. Only an
@@ -112,7 +111,7 @@ try {
     if (!latest) {
       fresh = true
     } else {
-      const resumed = await request('thread/resume', { threadId: latest.id, ...(model ? { model } : {}) }, resumeTimeoutMs)
+      const resumed = await request('thread/resume', { threadId: latest.id }, resumeTimeoutMs)
       thread = resumed.thread
     }
   }

@@ -143,6 +143,13 @@ model response. Model authorization, quota and external-network failures can
 still occur on a subsequent turn and must be reported separately. The readiness
 probe itself never upgrades, reauthorizes, confirms modals or restarts.
 
+Workshop model settings are startup defaults. After a session-only change via
+Codex `/model`, the next Telegram or Lark delivery (including a scheduled turn)
+uses that thread's selection without a restart or re-registration. The Channel
+does not select a model on thread creation, resume or delivery. In Channel
+status, `observed_model` is the last model Codex returned on creation/resume;
+it is not a live readout of the TUI's current selection.
+
 ### Restart-time Codex updates
 
 Only an explicit `workshop restart` opts newly created panes into update
